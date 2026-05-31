@@ -1,0 +1,143 @@
+services:
+  sdkm:
+    image: sdkmanager-jetpack
+    build:
+      context: .
+      dockerfile_inline: |
+        ARG FROM_IMAGE=sdkmanager:2.4.0.13236-Ubuntu_24.04
+        ARG CUDA_HOST_REPO_BASE_URL=https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64
+        ARG CUDA_HOST_PIN_FILE=cuda-ubuntu2404.pin
+        ARG CUDA_CROSS_REPO_BASE_URL=https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/cross-linux-aarch64
+        ARG CUDA_KEYRING_DEB=cuda-keyring_1.1-1_all.deb
+        ARG CUDA_HOST_APT_PACKAGES="cuda-compiler-12-9 cuda-compiler-12-6"
+        ARG CUDA_CROSS_APT_PACKAGES="cuda-cross-aarch64-12-9"
+        ARG NCCL_REPO_BASE_URL=https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/sbsa
+        ARG NCCL_VERSION=2.29.3-1+cuda12.9
+        FROM $${FROM_IMAGE}
+
+        USER root
+        ARG DEBIAN_FRONTEND=noninteractive
+        ARG JETPACK=6.2.2
+        ARG CUDA_HOST_REPO_BASE_URL
+        ARG CUDA_HOST_PIN_FILE
+        ARG CUDA_CROSS_REPO_BASE_URL
+        ARG CUDA_KEYRING_DEB
+        ARG CUDA_HOST_APT_PACKAGES
+        ARG CUDA_CROSS_APT_PACKAGES
+        ARG NCCL_REPO_BASE_URL
+        ARG NCCL_VERSION
+
+        RUN apt-get update && apt-get install -y --no-install-recommends \
+            qemu-user-static \
+            binfmt-support \
+            binutils \
+            lbzip2 \
+            wget \
+            curl \
+            git \
+            ca-certificates \
+            usbutils \
+            sudo \
+            kmod \
+            iproute2 \
+            iputils-ping \
+            nfs-kernel-server \
+            rpcbind \
+            sshpass \
+            device-tree-compiler \
+            libxml2-utils \
+            cpio \
+            gzip \
+            xz-utils \
+            zstd \
+            lz4 \
+            file \
+            openssh-client \
+            openssh-server \
+            locales \
+            abootimg \
+            cpp \
+            uuid-runtime \
+            build-essential \
+            cmake \
+            ninja-build \
+            python3 \
+            python3-pip \
+            clang \
+            libclang-dev \
+            libssl-dev \
+            unzip \
+            patchelf \
+            pkg-config \
+         && rm -rf /var/lib/apt/lists/*
+
+        RUN sed -i '/^Architectures:/d' /etc/apt/sources.list.d/ubuntu.sources \
+         && sed -i '/^Signed-By:/a Architectures: amd64' /etc/apt/sources.list.d/ubuntu.sources \
+         && printf '%s\n' \
+              'Types: deb' \
+              'URIs: http://ports.ubuntu.com/ubuntu-ports/' \
+              'Suites: noble noble-updates noble-backports' \
+              'Components: main universe restricted multiverse' \
+              'Architectures: arm64' \
+              'Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg' \
+              '' \
+              'Types: deb' \
+              'URIs: http://ports.ubuntu.com/ubuntu-ports/' \
+              'Suites: noble-security' \
+              'Components: main universe restricted multiverse' \
+              'Architectures: arm64' \
+              'Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg' \
+              > /etc/apt/sources.list.d/ubuntu-ports-arm64.sources \
+         && dpkg --add-architecture arm64 \
+         && wget -O "/tmp/$${CUDA_HOST_PIN_FILE}" "$${CUDA_HOST_REPO_BASE_URL}/$${CUDA_HOST_PIN_FILE}" \
+         && mv "/tmp/$${CUDA_HOST_PIN_FILE}" /etc/apt/preferences.d/cuda-repository-pin-600 \
+         && wget -O "/tmp/$${CUDA_KEYRING_DEB}" "$${CUDA_HOST_REPO_BASE_URL}/$${CUDA_KEYRING_DEB}" \
+         && dpkg -i "/tmp/$${CUDA_KEYRING_DEB}" \
+         && printf '%s\n' "deb [signed-by=/usr/share/keyrings/cuda-archive-keyring.gpg] $${CUDA_CROSS_REPO_BASE_URL}/ /" > /etc/apt/sources.list.d/cuda-cross-aarch64.list \
+         && apt-get update \
+         && apt-get -y install $${CUDA_HOST_APT_PACKAGES} $${CUDA_CROSS_APT_PACKAGES} \
+         && wget -O "/tmp/libnccl2_$${NCCL_VERSION}_arm64.deb" "$${NCCL_REPO_BASE_URL}/libnccl2_$${NCCL_VERSION}_arm64.deb" \
+         && wget -O "/tmp/libnccl-dev_$${NCCL_VERSION}_arm64.deb" "$${NCCL_REPO_BASE_URL}/libnccl-dev_$${NCCL_VERSION}_arm64.deb" \
+         && apt-get -y install "/tmp/libnccl2_$${NCCL_VERSION}_arm64.deb" "/tmp/libnccl-dev_$${NCCL_VERSION}_arm64.deb" \
+         && rm -f "/tmp/libnccl2_$${NCCL_VERSION}_arm64.deb" "/tmp/libnccl-dev_$${NCCL_VERSION}_arm64.deb" \
+         && rm -f "/tmp/$${CUDA_KEYRING_DEB}" \
+         && rm -rf /var/lib/apt/lists/*
+
+        ENTRYPOINT []
+        ENV CARGO_HOME=/home/nvidia/.cargo
+        ENV RUSTUP_HOME=/home/nvidia/.rustup
+        ENV CUDA_HOME=/usr/local/cuda-12.9
+        ENV PATH=/home/nvidia/.cargo/bin:/usr/local/cuda-12.9/bin:$${PATH}
+        USER nvidia
+        RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | bash -s -- -y --profile minimal --default-toolchain stable \
+         && /home/nvidia/.cargo/bin/rustup target add aarch64-unknown-linux-gnu
+        WORKDIR /home/nvidia
+
+    privileged: true
+    network_mode: host
+    working_dir: /home/nvidia
+    environment:
+      TASK: ${TASK:-shell}
+      JETPACK: ${JETPACK:-6.2.2}
+      HOST_VOLUME: ${VOLUME:?set VOLUME to your sdk_manager directory}
+      REPO: ${REPO:-}
+      FLASH_TARGET: ${FLASH_TARGET:-internal}
+      TOOLCHAIN_URL: ${TOOLCHAIN_URL:-https://developer.nvidia.com/downloads/embedded/l4t/r36_release_v3.0/toolchain/aarch64--glibc--stable-2022.08-1.tar.bz2}
+      RUST_TOOLCHAIN: ${RUST_TOOLCHAIN:-stable}
+      RUST_TARGET: ${RUST_TARGET:-aarch64-unknown-linux-gnu}
+      CUDA_COMPUTE_CAP: ${CUDA_COMPUTE_CAP:-87}
+      MISTRALRS_FEATURES: ${MISTRALRS_FEATURES:-}
+      NCCL_REPO_DEB: ${NCCL_REPO_DEB:-}
+    volumes:
+      - /dev:/dev
+      - /dev/bus/usb:/dev/bus/usb
+      - ./sdkm-entrypoint.sh:/usr/local/bin/sdkm-entrypoint.sh:ro
+      - ${VOLUME:?set VOLUME to your sdk_manager directory}/downloads:/work/downloads
+      - ${VOLUME:?set VOLUME to your sdk_manager directory}/downloads:${VOLUME:?set VOLUME to your sdk_manager directory}/downloads
+      - ${VOLUME:?set VOLUME to your sdk_manager directory}/tmp:/work/tmp
+      - ${VOLUME:?set VOLUME to your sdk_manager directory}/.nvsdkm:/home/nvidia/.nvsdkm
+      - ${VOLUME:?set VOLUME to your sdk_manager directory}/toolchains:/work/toolchains
+      - ${VOLUME:?set VOLUME to your sdk_manager directory}/sources:/work/sources
+      - ./sdkmctl.sh:/usr/local/bin/sdkmctl:ro
+
+    entrypoint: ["/bin/bash", "/usr/local/bin/sdkm-entrypoint.sh"]
