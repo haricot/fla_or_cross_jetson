@@ -1,0 +1,28 @@
+name: V2-R0 baseline (non-destructive)
+
+on:
+  push:
+    branches: [v2-r0-fix17-recovery]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  static-and-synthetic:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify archived sources
+        run: sha256sum --check SHA256SUMS
+      - name: Validate Bash syntax
+        shell: bash
+        run: |
+          bash -n jetsonctl
+          find . -name '*.sh' -type f -print0 | xargs -0 -r -n1 bash -n
+      - name: Validate cumulative V2-R0 gates
+        shell: bash
+        run: ./gates/audit-fix17.sh
+      - name: Explicit Rust resolver compile
+        run: cargo check --manifest-path secret-plane/Cargo.toml

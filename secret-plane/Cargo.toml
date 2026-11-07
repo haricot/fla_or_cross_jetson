@@ -1,0 +1,17 @@
+[package]
+name = "jetson-secret-plane"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+name = "jetson_secret_plane"
+path = "src/lib.rs"
+
+[[bin]]
+name = "jetson-secret-resolver"
+path = "src/main.rs"
+
+[dependencies]
+secretspec = { version = "=0.20.0", default-features = false, features = ["keyring"] }
+secrecy = "=0.10.3"
