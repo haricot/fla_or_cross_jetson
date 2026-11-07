@@ -2,6 +2,16 @@
 
 Branch: `v2-r4-p3-jetpack721-sysroot-abi` (based on R4-P2).
 
+Status (2026-11-07): **PASS_SIGNED_JP721_ARM64_SYSROOT / PASS_UBUNTU_ARM64_CUDART13_STATIC_ABI / BLOCKED_ORIGINAL_NIX_ELF / NOT_TESTED_ON_DEVICE**.
+
+Final R4-P3 CI: https://github.com/haricot/fla_or_cross_jetson/actions/runs/42401836040
+
+- Evidence manifest and ABI JSON reports (expires 2026-12-07):
+  https://github.com/haricot/fla_or_cross_jetson/actions/runs/42401836040/artifacts/13585394700
+- Reusable **self-built** ARM64 ABI probe ELF, without redistributed NVIDIA
+  libraries (expires 2026-12-07):
+  https://github.com/haricot/fla_or_cross_jetson/actions/runs/42401836040/artifacts/13586265454
+
 Target: **Jetson Orin Nano Super / SM87 / AArch64**, NVIDIA
 **JetPack 7.2.1 / L4T 39.2.1 / Ubuntu 24.04 / CUDA 13.2.2**.
 Source: https://developer.nvidia.com/embedded/jetpack/downloads
@@ -73,6 +83,11 @@ https://github.com/haricot/fla_or_cross_jetson/actions/runs/42401205864
 `libcudart.so.13`. Unlike the pre-existing Nix ELF, this must satisfy the
 same static ELF gate in `--expect pass` mode. It does **not** contain an SM87
 kernel; R4-P2 already supplies independent physical SM87 cubin evidence.
+
+In the final CI run the probe printed
+`R4_P3_UBUNTU_ARM64_CUDART13_LINK=PASS_STATIC_ONLY` and the audit returned
+`R4_P3_ABI=PASS_STATIC_ABI reasons=` (empty reason list). The legacy Nix
+binary still returned exactly `NIX_STORE_INTERPRETER,NIX_STORE_RPATH`.
 
 The probe is *not run* in CI. Passing the link and static symbol checks does
 not demonstrate a working CUDA driver, GPU kernel execution, device power
