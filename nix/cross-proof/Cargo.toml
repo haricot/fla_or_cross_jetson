@@ -1,0 +1,9 @@
+[package]
+name = "jetson-cross-proof"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "jetson-cross-proof"
+path = "src/main.rs"

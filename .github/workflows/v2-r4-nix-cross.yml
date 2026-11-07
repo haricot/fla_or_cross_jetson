@@ -1,0 +1,43 @@
+name: V2-R4 cross Rust via Nix (non-destructive)
+
+on:
+  push:
+    branches: [v2-r234-nix-cross-foundation]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  nix-cross-eval:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cachix/install-nix-action@v31.11.3
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+      - name: Prepare R1 legacy /work and run inherited gates
+        shell: bash
+        run: |
+          sudo install -d -o "$(id -un)" -g "$(id -gn)" -m 0755 /work /work/tmp /work/tmp/state
+          ./gates/audit-r234.sh
+      - name: Generate lock (CI bootstrap only)
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          nix flake lock
+          echo "R4_LOCK_BASE64=$(base64 -w0 flake.lock)"
+          echo 'Reproducibility gate: pending publication of flake.lock to Git'
+      - name: Evaluate cross Rust target
+        run: nix eval --raw .#packages.x86_64-linux.cross-rust-aarch64.drvPath
+      - name: Build aarch64 Rust ELF (CPU-only)
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          result=$(nix build .#cross-rust-aarch64 --no-link --print-out-paths)
+          file "$result/bin/jetson-cross-proof"
+          file "$result/bin/jetson-cross-proof" | grep -q 'ARM aarch64'
+          readelf -h "$result/bin/jetson-cross-proof" | grep -Eq 'Machine:.*AArch64'
+          echo 'R4-P0 Rust x86_64 -> aarch64: PASS'
