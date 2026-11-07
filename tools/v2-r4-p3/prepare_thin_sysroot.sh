@@ -24,9 +24,10 @@ curl --fail --location --silent --show-error --retry 3 \
 gpg --show-keys --with-fingerprint "$apt_workdir/nvidia-jetson.gpg" > "$out_dir/evidence/nvidia-key.txt"
 
 tee "$apt_workdir/sources.list" >/dev/null <<EOF
-deb [arch=arm64 signed-by=/usr/share/keyrings/ubuntu-archive-keyring.gpg] https://ports.ubuntu.com/ubuntu-ports noble noble-updates noble-security main universe
+deb [arch=arm64 signed-by=/usr/share/keyrings/ubuntu-archive-keyring.gpg] https://ports.ubuntu.com/ubuntu-ports noble main universe
+deb [arch=arm64 signed-by=/usr/share/keyrings/ubuntu-archive-keyring.gpg] https://ports.ubuntu.com/ubuntu-ports noble-updates main universe
+deb [arch=arm64 signed-by=/usr/share/keyrings/ubuntu-archive-keyring.gpg] https://ports.ubuntu.com/ubuntu-ports noble-security main universe
 deb [arch=arm64 signed-by=$apt_workdir/nvidia-jetson.gpg] https://repo.download.nvidia.com/jetson/common r39.2 main
-deb [arch=arm64 signed-by=$apt_workdir/nvidia-jetson.gpg] https://repo.download.nvidia.com/jetson/t234 r39.2 main
 EOF
 
 apt_opts=(
