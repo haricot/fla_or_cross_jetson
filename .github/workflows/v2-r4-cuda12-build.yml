@@ -1,0 +1,39 @@
+name: V2-R4 CUDA 12.6 upstream build control (no Jetson)
+on:
+  push:
+    branches: [v2-r234-nix-cross-foundation]
+    paths:
+      - '.github/workflows/v2-r4-cuda12-build.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  cuda126-control:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cachix/install-nix-action@v31.11.3
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+            max-jobs = 2
+      - name: Check independent pinned CUDA/Nix inputs
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          nix flake lock ./experiments/cuda-jetpack
+          git diff --exit-code -- experiments/cuda-jetpack/flake.lock
+      - name: Build upstream-tested CUDA 12.6 SAXPY target
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          out=$(nix build -L --no-link --print-out-paths ./experiments/cuda-jetpack#cuda12-6-cross-saxpy)
+          binary="$out/bin/saxpy"
+          test -x "$binary"
+          file "$binary"
+          file "$binary" | grep -q 'ARM aarch64'
+          readelf -h "$binary" | grep -Eq 'Machine:.*AArch64'
+          echo 'R4-P1 CUDA 12.6 cross-built AArch64 SAXPY: PASS (compilation only, no GPU runtime)'
