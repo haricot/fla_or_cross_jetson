@@ -29,6 +29,13 @@
       ];
       cuda126Pkgs = withDefaultCuda "cudaPackages_12_6";
       cuda132Pkgs = withDefaultCuda "cudaPackages_13_2";
+      # Separate forward-compatibility probe. JetPack 7.2.1 itself ships CUDA 13.2.2.
+      cuda133Pkgs = withDefaultCuda "cudaPackages_13_3";
+      hostCuda133 = import nixpkgs {
+        localSystem = "x86_64-linux";
+        config.allowUnfree = true;
+        overlays = [ (final: prev: { cudaPackages = prev.cudaPackages_13_3; }) ];
+      };
     in
     {
       packages.x86_64-linux.cuda12-6-cross-saxpy = pkgs.cudaPackages_12_6.saxpy;
@@ -37,5 +44,8 @@
       # Isolated diagnostic targets; preserve existing baseline derivations.
       packages.x86_64-linux.cuda12-6-default-cross-saxpy = cuda126Pkgs.cudaPackages.saxpy;
       packages.x86_64-linux.cuda13-2-default-cross-saxpy = cuda132Pkgs.cudaPackages.saxpy;
+      # R4-P2: genuine CUDA 13.3 cross compiler and host-side fatbin inspector.
+      packages.x86_64-linux.cuda13-3-default-cross-saxpy = cuda133Pkgs.cudaPackages.saxpy;
+      packages.x86_64-linux.cuda13-3-host-cuobjdump = hostCuda133.cudaPackages.cuda_cuobjdump;
     };
 }
