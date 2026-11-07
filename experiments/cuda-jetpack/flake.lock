@@ -1,0 +1,75 @@
+{
+  "nodes": {
+    "cuda-legacy": {
+      "inputs": {
+        "flake-parts": [
+          "jetpack",
+          "cuda-legacy"
+        ],
+        "nixpkgs": [
+          "jetpack",
+          "nixpkgs"
+        ]
+      },
+      "locked": {
+        "lastModified": 1779836515,
+        "narHash": "sha256-X/AwJZeTjxetRM7JG2BXeffKa1PIg/uo8AP5TX/+kb0=",
+        "owner": "nixos-cuda",
+        "repo": "cuda-legacy",
+        "rev": "baf22622e1114bb36412e5cebe2303f302edb882",
+        "type": "github"
+      },
+      "original": {
+        "owner": "nixos-cuda",
+        "repo": "cuda-legacy",
+        "type": "github"
+      }
+    },
+    "jetpack": {
+      "inputs": {
+        "cuda-legacy": "cuda-legacy",
+        "nixpkgs": [
+          "nixpkgs"
+        ]
+      },
+      "locked": {
+        "lastModified": 1793318896,
+        "narHash": "sha256-KWpbRFgXrEHbbpmKHDi1D8fymUo5Dm8gLovAVhWFTjk=",
+        "owner": "anduril",
+        "repo": "jetpack-nixos",
+        "rev": "2a4d495b45af809502cb87a757bb12d54f227dbd",
+        "type": "github"
+      },
+      "original": {
+        "owner": "anduril",
+        "repo": "jetpack-nixos",
+        "rev": "2a4d495b45af809502cb87a757bb12d54f227dbd",
+        "type": "github"
+      }
+    },
+    "nixpkgs": {
+      "locked": {
+        "lastModified": 1793865203,
+        "narHash": "sha256-/cpdPHaySDIyCgZI6EWngiM6jK3YLUNzv1b7lTzy6Bk=",
+        "owner": "NixOS",
+        "repo": "nixpkgs",
+        "rev": "c56a87d8e41ce69bd2af57eb35dcc117a9dfca33",
+        "type": "github"
+      },
+      "original": {
+        "owner": "NixOS",
+        "ref": "nixos-26.05",
+        "repo": "nixpkgs",
+        "type": "github"
+      }
+    },
+    "root": {
+      "inputs": {
+        "jetpack": "jetpack",
+        "nixpkgs": "nixpkgs"
+      }
+    }
+  },
+  "root": "root",
+  "version": 7
+}

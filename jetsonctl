@@ -1,0 +1,1257 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+source "$ROOT/lib/platform.sh"
+source "$ROOT/lib/secrets.sh"
+
+# fix14: --platform is a global selector and may appear before or after the
+# subcommand, e.g. `jetsonctl --platform orin-nx cross cargo ...` or
+# `jetsonctl cross cargo --platform orin-nx ...`.
+PLATFORM_CLI=""
+_platform_args=()
+while (($#)); do
+  case "$1" in
+    --platform)
+      [[ $# -ge 2 ]] || { echo '--platform demande NAME' >&2; exit 2; }
+      PLATFORM_CLI=$2
+      shift 2
+      ;;
+    *) _platform_args+=("$1"); shift ;;
+  esac
+done
+set -- "${_platform_args[@]}"
+unset _platform_args
+
+if [[ "${1:-}" == "headless-flash" ]]; then
+  shift
+  [[ -n "$PLATFORM_CLI" ]] && export JETSON_PLATFORM="$PLATFORM_CLI"
+  exec "$ROOT/flash/headless.sh" "$@"
+fi
+
+platform_load "$ROOT" "$PLATFORM_CLI"
+VOLUME=${VOLUME:-$HOME/.cache/fla_or_cross_jetson/$PROFILE_NAME}
+CACHE_ROOT=${CACHE_ROOT:-$VOLUME/cache}
+CARGO_CACHE_DIR=${CARGO_CACHE_DIR:-$CACHE_ROOT/cargo-home}
+CARGO_TARGET_ROOT=${CARGO_TARGET_ROOT:-$CACHE_ROOT/cargo-target}
+BUILDKIT_CACHE_DIR=${BUILDKIT_CACHE_DIR:-$CACHE_ROOT/buildkit}
+MISTRALRS_TARGET_DIR=${MISTRALRS_TARGET_DIR:-$CARGO_TARGET_ROOT/mistralrs-$PROFILE_NAME}
+mkdir -p \
+  "$VOLUME"/{downloads,tmp,.nvsdkm,sources,dist,custom,secrets} \
+  "$VOLUME"/sdkmanager/{downloads,catalog,response-files,manifests} \
+  "$VOLUME"/{state,logs/flash} \
+  "$CARGO_CACHE_DIR" \
+  "$CARGO_TARGET_ROOT" \
+  "$BUILDKIT_CACHE_DIR" \
+  "$MISTRALRS_TARGET_DIR"
+
+need() { command -v "$1" >/dev/null || { echo "$1 est requis" >&2; exit 1; }; }
+
+buildx_bake_cached() {
+  local target="$1"
+  local cache_key="$2"
+  local cache_dir="$BUILDKIT_CACHE_DIR/$cache_key"
+  local next_dir="$BUILDKIT_CACHE_DIR/${cache_key}.next"
+  local old_dir="$BUILDKIT_CACHE_DIR/${cache_key}.old"
+  local args=(-f "$ROOT/docker-bake.hcl" "$target")
+
+  rm -rf "$next_dir" "$old_dir"
+  mkdir -p "$next_dir"
+
+  if [[ -f "$cache_dir/index.json" ]]; then
+    args+=(--set "$target.cache-from=type=local,src=$cache_dir")
+  fi
+  args+=(--set "$target.cache-to=type=local,dest=$next_dir,mode=max")
+
+  if ! docker buildx bake "${args[@]}"; then
+    rm -rf "$next_dir"
+    return 1
+  fi
+
+  if [[ -d "$cache_dir" ]]; then
+    mv "$cache_dir" "$old_dir"
+  fi
+  mv "$next_dir" "$cache_dir"
+  rm -rf "$old_dir"
+}
+
+cross_image_fingerprint() {
+  local wrapper_hash
+  wrapper_hash=$(sha256sum \
+    "$ROOT/containers/cross.Dockerfile" \
+    "$ROOT/gates/audit-cross-image.sh" \
+    "$ROOT/gates/audit-jetson-link.sh" \
+    | sha256sum | awk '{print $1}')
+  # The cross image contains the generic AArch64/SBSA toolchain. sm87/sm110
+  # selection happens at gate/build time and must not force an image rebuild.
+  printf '%s' "${wrapper_hash}|${RUST_TOOLCHAIN}|${RUST_TARGET}|${CUDA_VERSION}|${CUDA_VERSION_FULL}|${CUDA_CROSS_PACKAGE}|${CUDA_CROSS_REPO}" \
+    | sha256sum | awk '{print $1}'
+}
+
+cross_image_state() {
+  need docker
+  if ! docker image inspect "$CROSS_IMAGE" >/dev/null 2>&1; then
+    printf 'ABSENT\n'
+    return 0
+  fi
+  local want have
+  want=$(cross_image_fingerprint)
+  have=$(docker image inspect -f '{{ index .Config.Labels "org.haricot.fla.cross-wrapper-fingerprint" }}' "$CROSS_IMAGE" 2>/dev/null || true)
+  if [[ -n "$have" && "$have" == "$want" ]]; then printf 'READY\n'; else printf 'STALE\n'; fi
+}
+
+build_cross_image() {
+  need docker
+  docker buildx version >/dev/null
+  local fingerprint
+  fingerprint=$(cross_image_fingerprint)
+  echo "Cross image fingerprint: $fingerprint"
+  RUST_TOOLCHAIN="$RUST_TOOLCHAIN" CUDA_VERSION="$CUDA_VERSION" CUDA_VERSION_FULL="$CUDA_VERSION_FULL" CUDA_CROSS_PACKAGE="$CUDA_CROSS_PACKAGE" \
+  CUDA_CROSS_REPO="$CUDA_CROSS_REPO" CUDA_KEYRING_VERSION="$CUDA_KEYRING_VERSION" CROSS_IMAGE="$CROSS_IMAGE" \
+  CROSS_IMAGE_FINGERPRINT="$fingerprint" \
+    buildx_bake_cached cross cross
+}
+
+ensure_cross_image() {
+  local state
+  state=$(cross_image_state)
+  case "$state" in
+    READY) return 0 ;;
+    ABSENT) echo 'Image cross absente: construction automatique.' ;;
+    STALE) echo 'Image cross obsolète pour fix14/toolchain courant: reconstruction automatique.' ;;
+    *) echo "État image cross inattendu: $state" >&2; exit 1 ;;
+  esac
+  build_cross_image
+  [[ "$(cross_image_state)" == READY ]] || { echo 'Image cross non conforme après build.' >&2; exit 1; }
+}
+
+sdkmanager_image_fingerprint() {
+  local wrapper_hash
+  wrapper_hash=$(sha256sum \
+    "$ROOT/containers/sdkmanager.Dockerfile" \
+    "$ROOT/flash/entrypoint.sh" \
+    "$ROOT/flash/compose.yaml" \
+    | sha256sum | awk '{print $1}')
+  printf '%s' "${wrapper_hash}|${SDK_MANAGER_BOOTSTRAP_IMAGE}|${SDK_MANAGER_APT_DISTRO}|${SDK_MANAGER_APT_VERSION_PREFIX}" \
+    | sha256sum | awk '{print $1}'
+}
+
+sdkmanager_image_state() {
+  need docker
+  if ! docker image inspect "$SDK_MANAGER_IMAGE" >/dev/null 2>&1; then
+    printf 'ABSENT\n'
+    return 0
+  fi
+  local want have
+  want=$(sdkmanager_image_fingerprint)
+  have=$(docker image inspect -f '{{ index .Config.Labels "org.haricot.fla.sdkm-wrapper-fingerprint" }}' "$SDK_MANAGER_IMAGE" 2>/dev/null || true)
+  if [[ -n "$have" && "$have" == "$want" ]]; then
+    printf 'READY\n'
+  else
+    printf 'STALE\n'
+  fi
+}
+
+build_sdkmanager_image() {
+  need docker
+  docker buildx version >/dev/null
+  local fingerprint
+  fingerprint=$(sdkmanager_image_fingerprint)
+  echo "Bootstrap SDK Manager ${SDK_MANAGER_APT_VERSION_PREFIX} depuis le dépôt NVIDIA (${SDK_MANAGER_APT_DISTRO})."
+  echo "SDK Manager wrapper fingerprint: ${fingerprint}"
+  SDK_MANAGER_BOOTSTRAP_IMAGE="$SDK_MANAGER_BOOTSTRAP_IMAGE" \
+  SDK_MANAGER_APT_DISTRO="$SDK_MANAGER_APT_DISTRO" \
+  SDK_MANAGER_APT_VERSION_PREFIX="$SDK_MANAGER_APT_VERSION_PREFIX" \
+  SDK_MANAGER_IMAGE="$SDK_MANAGER_IMAGE" \
+  SDK_MANAGER_IMAGE_FINGERPRINT="$fingerprint" \
+    buildx_bake_cached sdkmanager sdkmanager
+}
+
+ensure_sdkmanager_image() {
+  local state
+  state=$(sdkmanager_image_state)
+  case "$state" in
+    READY) return 0 ;;
+    ABSENT) echo "Image SDK Manager absente: bootstrap automatique." ;;
+    STALE) echo "Image SDK Manager obsolète par rapport au wrapper courant: reconstruction automatique." ;;
+    *) echo "État SDK Manager inattendu: $state" >&2; exit 1 ;;
+  esac
+  build_sdkmanager_image
+  state=$(sdkmanager_image_state)
+  [[ "$state" == READY ]] || { echo "Image SDK Manager non conforme après rebuild: $state" >&2; exit 1; }
+}
+
+source_git_repo() {
+  need git
+  local repo=$1 ref=$2 src=$3
+  [[ -n "$repo" && -n "$ref" && -n "$src" ]] || { echo 'source_git_repo: repo/ref/src requis' >&2; exit 2; }
+  if [[ ! -d "$src/.git" ]]; then
+    mkdir -p "$(dirname "$src")"
+    git clone "$repo" "$src"
+  fi
+  git -C "$src" remote set-url origin "$repo"
+  git -C "$src" fetch --prune --tags origin
+  if git -C "$src" show-ref --verify --quiet "refs/remotes/origin/$ref"; then
+    git -C "$src" checkout --detach "origin/$ref"
+  elif git -C "$src" show-ref --verify --quiet "refs/tags/$ref"; then
+    git -C "$src" checkout --detach "refs/tags/$ref"
+  elif git -C "$src" rev-parse --verify --quiet "$ref^{commit}" >/dev/null; then
+    git -C "$src" checkout --detach "$ref"
+  else
+    git -C "$src" fetch origin "$ref"
+    git -C "$src" checkout --detach FETCH_HEAD
+  fi
+  printf '%s\n' "$src"
+}
+
+repo_slug() {
+  local repo=$1 base
+  base=${repo##*/}; base=${base%.git}
+  base=$(printf '%s' "$base" | tr -cs 'A-Za-z0-9._-' '-')
+  printf '%s\n' "${base:-source}"
+}
+
+source_mistralrs() {
+  local src=${MISTRALRS_SOURCE_DIR:-$VOLUME/sources/mistral.rs}
+  source_git_repo "$MISTRALRS_REPO" "$MISTRALRS_REF" "$src"
+}
+
+cross_sysroot_gate() {
+  local sysroot=$1
+  [[ -d "$sysroot/usr" && -r "$sysroot/etc/os-release" ]] || { echo "Jetson sysroot absent/incomplet: $sysroot" >&2; exit 1; }
+  [[ -r "$sysroot/etc/nv_tegra_release" ]] || { echo "Jetson sysroot sans /etc/nv_tegra_release: $sysroot" >&2; exit 1; }
+  grep -q '^# R39 ' "$sysroot/etc/nv_tegra_release" || { echo 'Jetson sysroot L4T inattendu (R39 requis)' >&2; exit 1; }
+  [[ -d "$sysroot/usr/lib/aarch64-linux-gnu" ]] || { echo 'Jetson sysroot sans usr/lib/aarch64-linux-gnu' >&2; exit 1; }
+  if [[ "${NATIVE_CUDA_ENABLE:-1}" == 1 ]]; then
+    [[ -x "$sysroot${NATIVE_CUDA_ROOT:-/usr/local/cuda-13.3}/bin/nvcc" ]] || { echo 'Jetson sysroot sans native CUDA nvcc; lance ./jetsonctl native-sdk apply' >&2; exit 1; }
+    [[ -d "$sysroot${NATIVE_CUDA_COMPAT_DIR:-/usr/local/cuda-13.3/compat_orin}" ]] || { echo 'Jetson sysroot sans compat_orin; lance ./jetsonctl native-sdk apply' >&2; exit 1; }
+  fi
+  echo "Jetson sysroot: PASS ($sysroot)"
+}
+
+cross_cargo() {
+  local repo="" ref=master source_dir="" package="" bin="" features=""
+  local manifest_path="" artifact_name="" profile=release locked=1 no_default=0
+  while (($#)); do
+    case "$1" in
+      --repo) [[ $# -ge 2 ]] || { echo '--repo demande URL' >&2; exit 2; }; repo=$2; shift 2 ;;
+      --ref) [[ $# -ge 2 ]] || { echo '--ref demande branche/tag/SHA' >&2; exit 2; }; ref=$2; shift 2 ;;
+      --source-dir) [[ $# -ge 2 ]] || { echo '--source-dir demande PATH' >&2; exit 2; }; source_dir=$2; shift 2 ;;
+      --package|-p) [[ $# -ge 2 ]] || { echo '--package demande NAME' >&2; exit 2; }; package=$2; shift 2 ;;
+      --bin) [[ $# -ge 2 ]] || { echo '--bin demande NAME' >&2; exit 2; }; bin=$2; shift 2 ;;
+      --features) [[ $# -ge 2 ]] || { echo '--features demande LIST' >&2; exit 2; }; features=$2; shift 2 ;;
+      --manifest-path) [[ $# -ge 2 ]] || { echo '--manifest-path demande PATH' >&2; exit 2; }; manifest_path=$2; shift 2 ;;
+      --artifact-name) [[ $# -ge 2 ]] || { echo '--artifact-name demande NAME' >&2; exit 2; }; artifact_name=$2; shift 2 ;;
+      --no-default-features) no_default=1; shift ;;
+      --no-locked) locked=0; shift ;;
+      --locked) locked=1; shift ;;
+      --debug) profile=debug; shift ;;
+      --release) profile=release; shift ;;
+      -h|--help)
+        cat <<'EOF_CROSS_CARGO'
+usage: ./jetsonctl cross cargo --repo URL --ref REF --bin BIN [options]
+
+  --package NAME              Cargo package/workspace member
+  --features LIST             Cargo features, e.g. 'cuda,flash-attn'
+  --no-default-features
+  --manifest-path PATH
+  --source-dir PATH           checkout persistant explicite
+  --artifact-name NAME        nom sous VOLUME/dist (défaut: --bin)
+  --no-locked                 n'impose pas Cargo.lock
+  --debug                     build debug (release par défaut)
+EOF_CROSS_CARGO
+        return 0 ;;
+      *) echo "cross cargo: option inconnue $1" >&2; exit 2 ;;
+    esac
+  done
+  [[ -n "$repo" ]] || { echo 'cross cargo: --repo requis' >&2; exit 2; }
+  [[ -n "$bin" ]] || { echo 'cross cargo: --bin requis pour sélectionner/copier un artefact' >&2; exit 2; }
+  [[ -n "$artifact_name" ]] || artifact_name=$bin
+  [[ "$artifact_name" != */* ]] || { echo '--artifact-name ne doit pas contenir /' >&2; exit 2; }
+  need docker
+
+  ensure_cross_image
+
+  local slug src sysroot
+  slug=$(repo_slug "$repo")
+  src=${source_dir:-$VOLUME/sources/$slug}
+  src=$(source_git_repo "$repo" "$ref" "$src")
+  sysroot=${JETSON_SYSROOT:-$VOLUME/downloads/Linux_for_Tegra/rootfs}
+  cross_sysroot_gate "$sysroot"
+
+  local build_key target_dir cuda_target rustflags bindgen pkg_libdir lib_path
+  build_key=$(printf '%s\n' "$repo|$ref|$package|$bin|$features|$manifest_path|$profile|$no_default|$RUST_TARGET|$CUDA_COMPUTE_CAP" | sha256sum | awk '{print substr($1,1,16)}')
+  target_dir=${CROSS_TARGET_DIR:-$CARGO_TARGET_ROOT/generic-$slug-$build_key}
+  mkdir -p "$CARGO_CACHE_DIR" "$target_dir" "$VOLUME/dist"
+  cuda_target=/usr/local/cuda/targets/sbsa-linux
+  rustflags="-L native=/opt/jetson-sysroot/usr/lib/aarch64-linux-gnu -L native=/opt/jetson-sysroot/usr/lib/aarch64-linux-gnu/nvidia -L native=/opt/jetson-sysroot/lib/aarch64-linux-gnu -L native=${cuda_target}/lib -L native=${cuda_target}/lib/stubs -C link-arg=-Wl,-rpath-link,/opt/jetson-sysroot/usr/lib/aarch64-linux-gnu -C link-arg=-Wl,-rpath-link,/opt/jetson-sysroot/usr/lib/aarch64-linux-gnu/nvidia -C link-arg=-Wl,-rpath-link,${cuda_target}/lib -C link-arg=-Wl,-rpath-link,${cuda_target}/lib/stubs"
+  bindgen="--target=aarch64-linux-gnu -I/usr/aarch64-linux-gnu/include -I/opt/jetson-sysroot/usr/include -I/opt/jetson-sysroot/usr/include/aarch64-linux-gnu -I${cuda_target}/include"
+  pkg_libdir="/opt/jetson-sysroot/usr/lib/aarch64-linux-gnu/pkgconfig:/opt/jetson-sysroot/usr/lib/pkgconfig:/opt/jetson-sysroot/usr/share/pkgconfig"
+  lib_path="${cuda_target}/lib:${cuda_target}/lib/stubs:/opt/jetson-sysroot/usr/lib/aarch64-linux-gnu:/opt/jetson-sysroot/usr/lib/aarch64-linux-gnu/nvidia:/opt/jetson-sysroot/lib/aarch64-linux-gnu:/usr/aarch64-linux-gnu/lib"
+
+  local -a cargo=(cargo build --target "$RUST_TARGET")
+  [[ "$profile" == release ]] && cargo+=(--release)
+  (( locked == 1 )) && cargo+=(--locked)
+  [[ -n "$manifest_path" ]] && cargo+=(--manifest-path "$manifest_path")
+  [[ -n "$package" ]] && cargo+=(--package "$package")
+  cargo+=(--bin "$bin")
+  (( no_default == 1 )) && cargo+=(--no-default-features)
+  [[ -n "$features" ]] && cargo+=(--features "$features")
+
+  echo "=== GENERIC JETSON CROSS ==="
+  echo "repo=$repo"
+  echo "ref=$ref"
+  echo "source=$src"
+  echo "sysroot=$sysroot"
+  echo "target=$RUST_TARGET sm_${CUDA_COMPUTE_CAP} CUDA=$CUDA_VERSION"
+  echo "package=${package:--} bin=$bin features=${features:--}"
+
+  docker run --rm \
+    --user "$(id -u):$(id -g)" \
+    -e HOME=/tmp \
+    -e CARGO_HOME=/work/cargo-home \
+    -e RUSTUP_HOME=/opt/rustup \
+    -e CARGO_TARGET_DIR=/work/target \
+    -e CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \
+    -e CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc \
+    -e CXX_aarch64_unknown_linux_gnu=aarch64-linux-gnu-g++ \
+    -e AR_aarch64_unknown_linux_gnu=aarch64-linux-gnu-ar \
+    -e NVCC=/usr/local/cuda/bin/nvcc \
+    -e NVCC_CCBIN=/usr/bin/aarch64-linux-gnu-g++ \
+    -e CUDA_HOME=/usr/local/cuda \
+    -e CUDA_PATH=/usr/local/cuda \
+    -e CUDA_TARGET_ROOT="$cuda_target" \
+    -e CUDA_SBSA_ROOT="$cuda_target" \
+    -e CUDA_COMPUTE_CAP="$CUDA_COMPUTE_CAP" \
+    -e CUDA_NVCC_FLAGS="-arch=sm_${CUDA_COMPUTE_CAP}" \
+    -e CUDAARCHS="$CUDA_COMPUTE_CAP" \
+    -e CMAKE_CUDA_ARCHITECTURES="$CUDA_COMPUTE_CAP" \
+    -e CUDACXX=/usr/local/cuda/bin/nvcc \
+    -e CUDAFORGE_THREADS="${CUDAFORGE_THREADS:-8}" \
+    -e JETSON_SYSROOT=/opt/jetson-sysroot \
+    -e PKG_CONFIG_ALLOW_CROSS=1 \
+    -e PKG_CONFIG_SYSROOT_DIR=/opt/jetson-sysroot \
+    -e PKG_CONFIG_LIBDIR="$pkg_libdir" \
+    -e LIBRARY_PATH="$lib_path" \
+    -e BINDGEN_EXTRA_CLANG_ARGS_aarch64_unknown_linux_gnu="$bindgen" \
+    -e CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS="$rustflags" \
+    -v "$src:/work/src" \
+    -v "$CARGO_CACHE_DIR:/work/cargo-home" \
+    -v "$target_dir:/work/target" \
+    -v "$sysroot:/opt/jetson-sysroot:ro" \
+    -w /work/src \
+    "$CROSS_IMAGE" "${cargo[@]}"
+
+  local profile_dir=$profile
+  local built="$target_dir/$RUST_TARGET/$profile_dir/$bin"
+  [[ -x "$built" ]] || { echo "binaire absent: $built" >&2; exit 1; }
+  cp -f "$built" "$VOLUME/dist/$artifact_name"
+  chmod 0755 "$VOLUME/dist/$artifact_name"
+  "$ROOT/gates/audit-aarch64.sh" "$VOLUME/dist/$artifact_name"
+  "$ROOT/gates/audit-jetson-link.sh" "$VOLUME/dist/$artifact_name" "$sysroot"
+  echo "artifact: $VOLUME/dist/$artifact_name"
+}
+
+build_mistralrs() {
+  cross_cargo \
+    --repo "$MISTRALRS_REPO" \
+    --ref "$MISTRALRS_REF" \
+    --source-dir "${MISTRALRS_SOURCE_DIR:-$VOLUME/sources/mistral.rs}" \
+    --package "$MISTRALRS_PACKAGE" \
+    --bin "$MISTRALRS_BIN" \
+    --features "$MISTRALRS_FEATURES" \
+    --artifact-name "$MISTRALRS_BIN"
+}
+
+cross_deploy() {
+  need ssh
+  local artifact="" host=192.168.55.1 user=${DEFAULT_USER:-} identity="" remote_dir='.local/bin'
+  while (($#)); do
+    case "$1" in
+      --artifact) [[ $# -ge 2 ]] || { echo '--artifact demande PATH' >&2; exit 2; }; artifact=$2; shift 2 ;;
+      --host) [[ $# -ge 2 ]] || { echo '--host demande HOST' >&2; exit 2; }; host=$2; shift 2 ;;
+      --user) [[ $# -ge 2 ]] || { echo '--user demande USER' >&2; exit 2; }; user=$2; shift 2 ;;
+      --identity|-i) [[ $# -ge 2 ]] || { echo '--identity demande PATH' >&2; exit 2; }; identity=$2; shift 2 ;;
+      --remote-dir) [[ $# -ge 2 ]] || { echo '--remote-dir demande PATH relatif au HOME' >&2; exit 2; }; remote_dir=$2; shift 2 ;;
+      *) echo "cross deploy: option inconnue $1" >&2; exit 2 ;;
+    esac
+  done
+  [[ -n "$artifact" && -r "$artifact" ]] || { echo 'cross deploy: --artifact lisible requis' >&2; exit 2; }
+  [[ -n "$user" ]] || { echo 'cross deploy: --user requis (ou DEFAULT_USER)' >&2; exit 2; }
+  [[ "$remote_dir" != /* && "$remote_dir" != *..* && "$remote_dir" =~ ^[A-Za-z0-9._/+:-]+$ ]] || { echo '--remote-dir doit rester relatif au HOME, sans .. ni métacaractère shell' >&2; exit 2; }
+  local name=${artifact##*/}
+  [[ "$name" =~ ^[A-Za-z0-9._+-]+$ ]] || { echo 'nom d artefact non sûr pour deploy' >&2; exit 2; }
+  local -a ssh_opts=(-o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new)
+  [[ -n "$identity" ]] && ssh_opts+=(-i "$identity")
+  echo "Deploy $artifact -> ${user}@${host}:~/${remote_dir}/${name}"
+  ssh "${ssh_opts[@]}" "$user@$host" "mkdir -p ~/${remote_dir} && umask 022 && cat > ~/${remote_dir}/${name} && chmod 0755 ~/${remote_dir}/${name}" < "$artifact"
+  ssh "${ssh_opts[@]}" "$user@$host" "file ~/${remote_dir}/${name}; ls -l ~/${remote_dir}/${name}"
+}
+
+
+target_gate() {
+  need ssh
+  local host=192.168.55.1 user=${DEFAULT_USER:-} identity=""
+  while (($#)); do
+    case "$1" in
+      --host) [[ $# -ge 2 ]] || { echo '--host demande HOST' >&2; exit 2; }; host=$2; shift 2 ;;
+      --user) [[ $# -ge 2 ]] || { echo '--user demande USER' >&2; exit 2; }; user=$2; shift 2 ;;
+      --identity|-i) [[ $# -ge 2 ]] || { echo '--identity demande PATH' >&2; exit 2; }; identity=$2; shift 2 ;;
+      *) echo "target gate: option inconnue $1" >&2; exit 2 ;;
+    esac
+  done
+  [[ -n "$user" ]] || { echo 'target gate: --user requis (ou DEFAULT_USER)' >&2; exit 2; }
+  local cc=${CUDA_COMPUTE_CAP:?CUDA_COMPUTE_CAP absent} expected_major expected_minor
+  if [[ "$cc" =~ ^[0-9]{2}$ ]]; then
+    expected_major=${cc:0:1}; expected_minor=${cc:1:1}
+  elif [[ "$cc" =~ ^[0-9]{3}$ ]]; then
+    expected_major=${cc:0:2}; expected_minor=${cc:2:1}
+  else
+    echo "compute capability invalide: $cc" >&2; exit 2
+  fi
+  local cuda_root=${NATIVE_CUDA_ROOT:-/usr/local/cuda-13.3}
+  local compat=${NATIVE_CUDA_COMPAT_DIR:-/usr/local/cuda-13.3/compat_orin}
+  local -a opts=(-o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new)
+  [[ -n "$identity" ]] && opts+=(-i "$identity")
+  echo "Target gate -> ${user}@${host} platform=${PLATFORM_NAME:-unknown} sm_${cc}"
+  local remote_prefix
+  printf -v remote_prefix 'CUDA_ROOT=%q COMPAT=%q EXPECT_MAJOR=%q EXPECT_MINOR=%q EXPECT_ARCH=%q PLATFORM=%q' \
+    "$cuda_root" "$compat" "$expected_major" "$expected_minor" "$cc" "${PLATFORM_NAME:-unknown}"
+  ssh "${opts[@]}" "$user@$host" "$remote_prefix bash -s" <<'EOF_TARGET_GATE'
+set -Eeuo pipefail
+
+echo '=== TARGET PLATFORM ==='
+[[ "$(uname -m)" == aarch64 ]]
+uname -a
+head -n 2 /etc/nv_tegra_release
+findmnt /
+echo "platform_profile=$PLATFORM expected_sm=$EXPECT_ARCH"
+
+echo
+echo '=== CUDA TOOLKIT ==='
+test -x "$CUDA_ROOT/bin/nvcc"
+"$CUDA_ROOT/bin/nvcc" --version
+[[ -d "$COMPAT" ]]
+
+echo
+echo "=== CUDA RUNTIME SM${EXPECT_ARCH} ==="
+cat > /tmp/fla_cuda_gate.cu <<'EOF_CUDA'
+#include <cuda_runtime.h>
+#include <cstdio>
+#include <cstdlib>
+int main(int argc, char **argv) {
+    if (argc != 3) return 9;
+    int expect_major = std::atoi(argv[1]);
+    int expect_minor = std::atoi(argv[2]);
+    int n = 0;
+    cudaError_t e = cudaGetDeviceCount(&n);
+    if (e != cudaSuccess || n < 1) {
+        std::fprintf(stderr, "cudaGetDeviceCount failed: %s n=%d\n", cudaGetErrorString(e), n);
+        return 2;
+    }
+    cudaDeviceProp p{};
+    e = cudaGetDeviceProperties(&p, 0);
+    if (e != cudaSuccess) return 3;
+    std::printf("device=%s cc=%d.%d expected=%d.%d\n", p.name, p.major, p.minor, expect_major, expect_minor);
+    return (p.major == expect_major && p.minor == expect_minor) ? 0 : 4;
+}
+EOF_CUDA
+"$CUDA_ROOT/bin/nvcc" "-arch=sm_${EXPECT_ARCH}" /tmp/fla_cuda_gate.cu -o /tmp/fla_cuda_gate
+LD_LIBRARY_PATH="$COMPAT:$CUDA_ROOT/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+  /tmp/fla_cuda_gate "$EXPECT_MAJOR" "$EXPECT_MINOR"
+rm -f /tmp/fla_cuda_gate /tmp/fla_cuda_gate.cu
+
+echo
+echo '=== TARGET RESULT ==='
+echo "PASS: L4T + native CUDA + ${PLATFORM} + sm_${EXPECT_ARCH} runtime"
+EOF_TARGET_GATE
+}
+
+
+audit_cross_image() {
+  need docker
+  ensure_cross_image
+  "$ROOT/gates/audit-cross-image.sh" "$CROSS_IMAGE" "$CUDA_COMPUTE_CAP"
+}
+
+platform_cmd() {
+  local sub=${1:-current}; shift || true
+  case "$sub" in
+    list)
+      printf '%-22s %-7s %-6s %-12s %s\n' PLATFORM FAMILY CUDA TESTED NVIDIA_BOARD
+      local name path
+      while IFS= read -r name; do
+        path=$(platform_profile_path "$ROOT" "$name")
+        env -i PATH="$PATH" HOME="${HOME:-/tmp}" bash -c '
+          set -Eeuo pipefail
+          source "$1"
+          printf "%-22s %-7s sm%-4s %-12s %s\\n" "$PLATFORM_NAME" "$PLATFORM_FAMILY" "$CUDA_COMPUTE_CAP" "$PLATFORM_HARDWARE_TESTED" "$BOARD"
+        ' _ "$path"
+      done < <(platform_names "$ROOT")
+      ;;
+    current)
+      platform_summary
+      ;;
+    show)
+      local name=${1:-${PLATFORM_NAME:-}}
+      [[ -n "$name" ]] || { echo 'usage: jetsonctl platform show NAME' >&2; exit 2; }
+      local path
+      path=$(platform_profile_path "$ROOT" "$name")
+      [[ -r "$path" ]] || { echo "platform inconnue: $name" >&2; exit 2; }
+      env -i PATH="$PATH" HOME="${HOME:-/tmp}" bash -c '
+        set -Eeuo pipefail
+        set -a
+        source "$1"
+        set +a
+        env | grep -E "^(PLATFORM_|PROFILE_NAME|JETPACK|L4T|BOARD|SOC|RECOVERY_USB_PRODUCTS|L4T_GADGET_USB_PRODUCTS|SDKM_TARGET|FLASH_LAYOUT|FLASH_TARGET|FLASH_ROOTDEV|EXTERNAL_DEVICE|NVME_XML|QSPI_XML|FLASH_USE_QSPI_XML|CUDA_COMPUTE_CAP|NATIVE_CUDA_COMPAT_PACKAGE|NATIVE_CUDA_COMPAT_DIR|POST_FLASH_USB_GATE|AUTO_FORCE_RECOVERY)=" | sort
+      ' _ "$path"
+      ;;
+    *) echo 'usage: jetsonctl platform {list|current|show NAME}' >&2; exit 2 ;;
+  esac
+}
+
+cache_status() {
+  echo "VOLUME=$VOLUME"
+  echo "CACHE_ROOT=$CACHE_ROOT"
+  echo "CARGO_CACHE_DIR=$CARGO_CACHE_DIR"
+  echo "CARGO_TARGET_ROOT=$CARGO_TARGET_ROOT"
+  echo "MISTRALRS_TARGET_DIR=$MISTRALRS_TARGET_DIR"
+  echo "BUILDKIT_CACHE_DIR=$BUILDKIT_CACHE_DIR"
+  echo
+  for path in \
+    "$VOLUME/downloads" \
+    "$VOLUME/sources" \
+    "$CARGO_CACHE_DIR" \
+    "$MISTRALRS_TARGET_DIR" \
+    "$BUILDKIT_CACHE_DIR" \
+    "$VOLUME/dist"; do
+    if [[ -e "$path" ]]; then
+      du -sh "$path" 2>/dev/null || true
+    fi
+  done
+  echo
+  if command -v docker >/dev/null 2>&1; then
+    echo "Docker internal storage (not controlled by VOLUME):"
+    docker system df 2>/dev/null || true
+  fi
+}
+
+cache_clean() {
+  local what="${1:-}"
+  case "$what" in
+    cargo-home) rm -rf "$CARGO_CACHE_DIR"; mkdir -p "$CARGO_CACHE_DIR" ;;
+    cargo-target) rm -rf "$CARGO_TARGET_ROOT"; mkdir -p "$CARGO_TARGET_ROOT" "$MISTRALRS_TARGET_DIR" ;;
+    buildkit) rm -rf "$BUILDKIT_CACHE_DIR"; mkdir -p "$BUILDKIT_CACHE_DIR" ;;
+    all)
+      rm -rf "$CARGO_CACHE_DIR" "$CARGO_TARGET_ROOT" "$BUILDKIT_CACHE_DIR"
+      mkdir -p "$CARGO_CACHE_DIR" "$CARGO_TARGET_ROOT" "$MISTRALRS_TARGET_DIR" "$BUILDKIT_CACHE_DIR"
+      ;;
+    *)
+      echo "usage: jetsonctl cache clean {cargo-home|cargo-target|buildkit|all}" >&2
+      exit 2
+      ;;
+  esac
+}
+
+custom_init() {
+  local dest="$VOLUME/custom"
+  mkdir -p "$dest" "$VOLUME/secrets"
+  if find "$dest" -mindepth 1 -print -quit | grep -q .; then
+    echo "custom déjà initialisé: $dest"
+  else
+    cp -a "$ROOT/custom-template/." "$dest/"
+    echo "custom initialisé: $dest"
+  fi
+  echo "secrets: $VOLUME/secrets"
+}
+
+custom_show() {
+  custom_init >/dev/null
+  echo "CUSTOM_DIR=$VOLUME/custom"
+  echo "SECRETS_DIR=$VOLUME/secrets"
+  echo
+  echo "=== packages.txt ==="
+  cat "$VOLUME/custom/packages.txt" 2>/dev/null || true
+  echo
+  echo "=== services-enable.txt ==="
+  cat "$VOLUME/custom/services-enable.txt" 2>/dev/null || true
+  echo
+  echo "=== overlay ==="
+  find "$VOLUME/custom/overlay" -mindepth 1 -maxdepth 5 -printf '%P\n' 2>/dev/null | sort || true
+  echo
+  echo "=== hooks ==="
+  find "$VOLUME/custom/hooks" -maxdepth 1 -type f -printf '%f\n' 2>/dev/null | sort || true
+  echo
+  echo "=== secrets present (contents hidden) ==="
+  for f in default-password authorized_key.pub wifi-psk wifi-psk.enc; do
+    if [[ -s "$VOLUME/secrets/$f" ]]; then echo "$f: present"; else echo "$f: absent"; fi
+  done
+}
+
+secrets_status() {
+  echo "=== SECRET PLANE ==="
+  echo "MANIFEST=$(secret_plane_manifest)"
+  local version
+  version=$(secret_plane_cli_version 2>/dev/null || true)
+  if [[ -n "$version" ]]; then
+    echo "SecretSpec=$version"
+  elif secret_plane_resolver_bin >/dev/null 2>&1; then
+    echo "SecretSpec=embedded resolver (0.20.0)"
+  else
+    echo "SecretSpec=ABSENT"
+  fi
+  echo "host_provider=keyring"
+  echo "runtime_provider=systemd-credential"
+  secret_plane_status_line JETSON_PASSWORD headless keyring
+  secret_plane_status_line WIFI_PSK headless keyring
+  secret_plane_status_line GITHUB_TOKEN cross keyring
+  secret_plane_status_line GHCR_TOKEN cross keyring
+  echo
+  echo "=== LEGACY FILE SOURCES ==="
+  mkdir -p "$VOLUME/secrets"
+  for f in default-password authorized_key.pub wifi-psk wifi-psk.enc; do
+    if [[ -s "$VOLUME/secrets/$f" ]]; then
+      printf '%-20s present (%s)\n' "$f" "$(stat -c '%a' "$VOLUME/secrets/$f" 2>/dev/null || printf '?')"
+    else
+      printf '%-20s absent\n' "$f"
+    fi
+  done
+}
+
+secrets_install() {
+  need cargo
+  echo "=== INSTALL SECRETSPEC 0.20.0 ==="
+  cargo install --locked --force \
+    --version 0.20.0 \
+    --no-default-features \
+    --features cli,keyring \
+    secretspec
+  secretspec --version
+}
+
+secrets_build_resolver() {
+  need cargo
+  echo "=== BUILD JETSON SECRET RESOLVER ==="
+  cargo build --release --manifest-path "$ROOT/secret-plane/Cargo.toml"
+  "$ROOT/secret-plane/target/release/jetson-secret-resolver" version
+}
+
+secrets_doctor() {
+  echo "=== SECRET PLANE DOCTOR ==="
+  [[ -r "$(secret_plane_manifest)" ]] || { echo "manifest: FAIL"; return 1; }
+  echo "manifest: PASS ($(secret_plane_manifest))"
+  local version
+  version=$(secret_plane_cli_version 2>/dev/null || true)
+  if [[ "$version" =~ (^|[[:space:]])0\.20\.[0-9]+([[:space:]]|$) ]]; then
+    echo "SecretSpec CLI: PASS ($version)"
+  elif secret_plane_resolver_bin >/dev/null 2>&1; then
+    echo "SecretSpec resolver: PASS (embedded Rust resolver)"
+  else
+    echo "SecretSpec: FAIL (run ./jetsonctl secrets install)"
+    return 1
+  fi
+  if command -v secretspec >/dev/null 2>&1; then
+    env SECRETSPEC_FILE="$(secret_plane_manifest)" \
+      SECRETSPEC_PROVIDER=keyring SECRETSPEC_PROFILE=headless \
+      SECRETSPEC_REASON=secret-doctor \
+      secretspec check --no-prompt --json >/dev/null
+    echo "keyring provider/preflight: PASS"
+  else
+    echo "keyring provider/preflight: SKIP (CLI absent; resolver binary present)"
+  fi
+  echo "systemd-credential profile: CONFIGURED (runtime; read-only on target service)"
+}
+
+secrets_set_named() {
+  local name=$1 profile=$2
+  echo "=== STORE $name IN KEYRING ==="
+  secret_plane_set "$name" "$profile" keyring
+  echo "$name: STORED (value hidden)"
+}
+
+# Legacy compatibility helpers. New fix15 workflows should prefer the keyring.
+secrets_password_file() {
+  local out="$VOLUME/secrets/default-password" pass="" confirm=""
+  [[ -r /dev/tty ]] || { echo "TTY requis" >&2; exit 1; }
+  read -rsp "Mot de passe Jetson à enregistrer: " pass < /dev/tty; printf '\n' > /dev/tty
+  read -rsp "Confirme: " confirm < /dev/tty; printf '\n' > /dev/tty
+  [[ -n "$pass" && "$pass" == "$confirm" ]] || { unset pass confirm; echo "Mot de passe vide ou confirmation différente." >&2; exit 1; }
+  umask 077
+  printf '%s\n' "$pass" > "$out"
+  chmod 600 "$out"
+  unset pass confirm
+  echo "Mot de passe enregistré en mode 0600: $out (LEGACY)"
+}
+
+secrets_wifi_encrypt() {
+  need openssl
+  local out="$VOLUME/secrets/wifi-psk.enc" psk="" psk2="" encpass="" encpass2=""
+  [[ -r /dev/tty ]] || { echo "TTY requis" >&2; exit 1; }
+  read -rsp "PSK Wi-Fi à chiffrer: " psk < /dev/tty; printf '\n' > /dev/tty
+  read -rsp "Confirme le PSK Wi-Fi: " psk2 < /dev/tty; printf '\n' > /dev/tty
+  [[ -n "$psk" && "$psk" == "$psk2" ]] || { unset psk psk2; echo "PSK vide ou confirmation différente." >&2; exit 1; }
+  read -rsp "Passphrase OpenSSL: " encpass < /dev/tty; printf '\n' > /dev/tty
+  read -rsp "Confirme la passphrase OpenSSL: " encpass2 < /dev/tty; printf '\n' > /dev/tty
+  [[ -n "$encpass" && "$encpass" == "$encpass2" ]] || { unset psk psk2 encpass encpass2; echo "Passphrase vide ou confirmation différente." >&2; exit 1; }
+  mkdir -p "$VOLUME/secrets"
+  umask 077
+  printf '%s\n' "$psk" | openssl enc -aes-256-cbc -salt -pbkdf2 -pass fd:3 -out "$out" 3<<<"$encpass"
+  chmod 600 "$out"
+  unset psk psk2 encpass encpass2
+  rm -f "$VOLUME/secrets/wifi-psk"
+  echo "PSK Wi-Fi chiffré créé: $out (LEGACY)"
+}
+
+validate_download_file() {
+  local path=$1 label=$2
+  [[ -s "$path" ]] || { echo "$label absent ou vide: $path" >&2; return 1; }
+  tar -tf "$path" >/dev/null 2>&1 || { echo "$label invalide (tar illisible): $path" >&2; return 1; }
+}
+
+find_host_archive() {
+  local name=$1
+  find "$VOLUME/downloads" "$VOLUME/sdkmanager/downloads" -type f -name "$name" -print -quit 2>/dev/null || true
+}
+
+direct_download_one() {
+  local url=$1 dest=$2 label=$3
+  need curl
+  mkdir -p "$(dirname "$dest")"
+  if [[ -s "$dest" ]] && validate_download_file "$dest" "$label"; then
+    echo "$label: REUSE $dest"
+    return 0
+  fi
+  local part="${dest}.part"
+  echo "$label: téléchargement direct NVIDIA"
+  echo "  $url"
+  if ! curl -fL --retry 5 --retry-delay 2 --retry-all-errors --continue-at - -o "$part" "$url"; then
+    echo "Échec téléchargement direct: $url" >&2
+    echo "Tu peux placer manuellement $label sous $VOLUME/downloads ou surcharger L4T_*_URL dans le profil." >&2
+    return 1
+  fi
+  validate_download_file "$part" "$label"
+  mv -f "$part" "$dest"
+  echo "$label: PASS $dest"
+}
+
+download_direct_host() {
+  local out="$VOLUME/downloads/jetson-linux/R${L4T}"
+  mkdir -p "$out"
+  echo "Provider direct: Jetson Linux R${L4T}"
+  direct_download_one "$L4T_BSP_URL" "$out/$L4T_BSP_FILE" "BSP"
+  direct_download_one "$L4T_ROOTFS_URL" "$out/$L4T_ROOTFS_FILE" "Sample RootFS"
+}
+
+download_local_validate() {
+  local bsp rootfs
+  bsp=$(find_host_archive "$L4T_BSP_FILE")
+  rootfs=$(find_host_archive "$L4T_ROOTFS_FILE")
+  [[ -n "$bsp" ]] || { echo "BSP local absent: $L4T_BSP_FILE" >&2; return 1; }
+  [[ -n "$rootfs" ]] || { echo "RootFS local absent: $L4T_ROOTFS_FILE" >&2; return 1; }
+  validate_download_file "$bsp" BSP
+  validate_download_file "$rootfs" "Sample RootFS"
+  echo "Provider local: PASS"
+  echo "  BSP=$bsp"
+  echo "  RootFS=$rootfs"
+}
+
+compose_flash() {
+  need docker
+  ensure_sdkmanager_image
+  VOLUME="$VOLUME" docker compose -f "$ROOT/flash/compose.yaml" run --rm --user 0:0 sdkm "$@"
+}
+
+
+platform_sudo() {
+  sudo env \
+    RECOVERY_USB_PRODUCTS="${RECOVERY_USB_PRODUCTS:-}" \
+    L4T_GADGET_USB_PRODUCTS="${L4T_GADGET_USB_PRODUCTS-}" \
+    HOST_FLASH_IFACE="${HOST_FLASH_IFACE:-}" \
+    "$@"
+}
+
+host_guard_manual_state() {
+  printf '%s\n' "$VOLUME/state/host-usb-manual.tsv"
+}
+
+host_usb_cmd() {
+  local sub=${1:-status}; shift || true
+  local state; state=$(host_guard_manual_state)
+  case "$sub" in
+    status)
+      "$ROOT/host/usb-discover.sh" status
+      if [[ -r "$state" ]]; then
+        echo
+        echo "Manual guard state: $state"
+        tail -n 12 "$state" || true
+      fi
+      ;;
+    fix)
+      need sudo
+      sudo -v
+      mkdir -p "$(dirname "$state")"
+      touch "$state"
+      platform_sudo "$ROOT/host/usb-guard.sh" --state "$state" begin
+      if [[ "${1:-}" == "--wait-recovery" ]]; then
+        platform_sudo "$ROOT/host/usb-guard.sh" --state "$state" --timeout "${HOST_FLASH_IFACE_TIMEOUT:-1800}" wait-recovery
+      fi
+      echo "Guard laissé actif. Restaure avec: ./jetsonctl host usb restore"
+      ;;
+    restore)
+      need sudo
+      platform_sudo "$ROOT/host/usb-guard.sh" --state "$state" restore
+      ;;
+    *)
+      echo "usage: jetsonctl host usb {status|fix [--wait-recovery]|restore}" >&2
+      exit 2
+      ;;
+  esac
+}
+
+host_guard_cleanup() {
+  local rc=${1:-0}
+  if [[ -n "${HOST_GUARD_WATCHER_PID:-}" ]] && kill -0 "$HOST_GUARD_WATCHER_PID" 2>/dev/null; then
+    sudo kill "$HOST_GUARD_WATCHER_PID" 2>/dev/null || kill "$HOST_GUARD_WATCHER_PID" 2>/dev/null || true
+    wait "$HOST_GUARD_WATCHER_PID" 2>/dev/null || true
+  fi
+  if (( rc != 0 )) && [[ -n "${HOST_GUARD_RUN_DIR:-}" ]]; then
+    echo "Flash backend failed (rc=$rc); collecting host diagnosis."
+    "$ROOT/flash/diagnose.sh" --timeout 5 --no-wait > "$HOST_GUARD_RUN_DIR/diagnose.txt" 2>&1 || true
+    echo "Diagnostic: $HOST_GUARD_RUN_DIR/diagnose.txt"
+  fi
+  if [[ "${HOST_NFS_GUARD_ACTIVE:-0}" == 1 && -n "${HOST_GUARD_STATE_FILE:-}" ]]; then
+    sudo "$ROOT/host/nfs-guard.sh" \
+      --state "$HOST_GUARD_STATE_FILE" \
+      --l4t-dir "$VOLUME/downloads/Linux_for_Tegra" restore >/dev/null 2>&1 || true
+    HOST_NFS_GUARD_ACTIVE=0
+  fi
+  if [[ -n "${HOST_GUARD_STATE_FILE:-}" && -r "$HOST_GUARD_STATE_FILE" ]]; then
+    platform_sudo "$ROOT/host/usb-guard.sh" --state "$HOST_GUARD_STATE_FILE" restore >/dev/null 2>&1 || true
+  fi
+  if [[ -n "${HOST_GUARD_SUDO_PID:-}" ]] && kill -0 "$HOST_GUARD_SUDO_PID" 2>/dev/null; then
+    kill "$HOST_GUARD_SUDO_PID" 2>/dev/null || true
+    wait "$HOST_GUARD_SUDO_PID" 2>/dev/null || true
+  fi
+}
+
+host_guard_signal_exit() {
+  trap - EXIT INT TERM HUP
+  host_guard_cleanup 130
+  exit 130
+}
+
+auto_force_recovery_if_possible() {
+  if "$ROOT/host/usb-discover.sh" recovery-sysfs >/dev/null 2>&1; then
+    return 0
+  fi
+
+  case "${AUTO_FORCE_RECOVERY:-1}" in
+    1|true|yes) ;;
+    *)
+      echo 'Automatic Force Recovery: DISABLED; waiting for manual APX/RCM.'
+      return 1
+      ;;
+  esac
+
+  if ! "$ROOT/host/usb-discover.sh" l4t-sysfs >/dev/null 2>&1; then
+    return 1
+  fi
+
+  echo 'L4T USB gadget detected; attempting software Force Recovery before manual fallback.'
+  platform_sudo "$ROOT/host/usb-guard.sh" \
+    --state "$HOST_GUARD_STATE_FILE" fix-l4t-iface || true
+
+  local recovery_rc=0
+  if "$ROOT/host/enter-recovery.sh"; then
+    return 0
+  else
+    recovery_rc=$?
+  fi
+
+  echo "Automatic Force Recovery did not reach APX/RCM (rc=${recovery_rc})." >&2
+  echo 'Manual fallback remains available: enter Force Recovery physically.' >&2
+  return "$recovery_rc"
+}
+
+with_host_flash_guard() {
+  local mode=$1; shift
+  need sudo
+  need ip
+  need udevadm
+  need sysctl
+  sudo -v
+  HOST_GUARD_SUDO_PID=""
+  (
+    while true; do
+      sudo -n -v >/dev/null 2>&1 || exit 0
+      sleep 60
+    done
+  ) &
+  HOST_GUARD_SUDO_PID=$!
+
+  local stamp
+  stamp=$(date +%Y%m%d-%H%M%S)
+  HOST_GUARD_RUN_DIR="$VOLUME/logs/flash/${stamp}-$$"
+  HOST_GUARD_STATE_FILE="$HOST_GUARD_RUN_DIR/host-state.tsv"
+  HOST_GUARD_WATCHER_PID=""
+  HOST_NFS_GUARD_ACTIVE=0
+  mkdir -p "$HOST_GUARD_RUN_DIR"
+  touch "$HOST_GUARD_STATE_FILE"
+
+  echo "=== SMART HOST FLASH GUARD ==="
+  echo "log_dir=$HOST_GUARD_RUN_DIR"
+  trap 'rc=$?; host_guard_cleanup "$rc"' EXIT
+  trap 'host_guard_signal_exit' INT TERM HUP
+  platform_sudo "$ROOT/host/usb-guard.sh" --state "$HOST_GUARD_STATE_FILE" begin
+  sudo "$ROOT/host/loop-guard.sh"
+  local recovery_rc=0
+  if auto_force_recovery_if_possible; then
+    recovery_rc=0
+  else
+    recovery_rc=$?
+  fi
+
+  if [[ "$mode" == recovery && "$recovery_rc" -ne 0 && "${RECOVERY_MANUAL_FALLBACK_WAIT:-0}" != 1 ]]; then
+    trap - EXIT INT TERM HUP
+    host_guard_cleanup "$recovery_rc"
+    HOST_GUARD_WATCHER_PID=""
+    HOST_GUARD_STATE_FILE=""
+    HOST_GUARD_SUDO_PID=""
+    return "$recovery_rc"
+  fi
+
+  platform_sudo "$ROOT/host/usb-guard.sh" --state "$HOST_GUARD_STATE_FILE" --timeout "${HOST_FLASH_IFACE_TIMEOUT:-1800}" wait-recovery
+
+  if [[ "$mode" == flash ]]; then
+    echo "=== SMART HOST NFS GUARD ==="
+    # Mark active before begin so the EXIT trap restores partial NFS state even
+    # if a late RPC/mountd gate fails during begin itself.
+    HOST_NFS_GUARD_ACTIVE=1
+    sudo "$ROOT/host/nfs-guard.sh" \
+      --state "$HOST_GUARD_STATE_FILE" \
+      --l4t-dir "$VOLUME/downloads/Linux_for_Tegra" begin
+    HOST_FLASH_IFACE_INTERVAL="${HOST_FLASH_IFACE_INTERVAL:-0.25}" \
+    HOST_FLASH_KEEPALIVE_INTERVAL="${HOST_FLASH_KEEPALIVE_INTERVAL:-0.5}" \
+    sudo -E "$ROOT/flash/network-watch.sh" \
+      --state "$HOST_GUARD_STATE_FILE" \
+      --timeout "${HOST_FLASH_IFACE_TIMEOUT:-1800}" \
+      --ready-file "$HOST_GUARD_RUN_DIR/network-ready" \
+      > "$HOST_GUARD_RUN_DIR/network-watch.log" 2>&1 &
+    HOST_GUARD_WATCHER_PID=$!
+    echo "network_watcher_log=$HOST_GUARD_RUN_DIR/network-watch.log"
+  fi
+
+  local rc=0
+  set +e
+  HOST_FLASH_WATCH_EXTERNAL=1 "$@"
+  rc=$?
+  set -e
+  trap - EXIT INT TERM HUP
+  host_guard_cleanup "$rc"
+  HOST_GUARD_WATCHER_PID=""
+  HOST_GUARD_STATE_FILE=""
+  HOST_GUARD_SUDO_PID=""
+
+  if [[ "$mode" == flash && "$rc" -eq 0 ]]; then
+    case "${POST_FLASH_USB_GATE:-1}" in
+      1|true|yes)
+        echo "=== POST-FLASH L4T USB GATE ==="
+        if ! platform_sudo "$ROOT/host/post-flash-network.sh" --timeout "${POST_FLASH_USB_TIMEOUT:-120}"; then
+          echo "Post-flash USB management gate: WARN (flash itself succeeded)." >&2
+        fi
+        ;;
+    esac
+  fi
+  return "$rc"
+}
+
+flash_download() {
+  local provider="${DOWNLOAD_PROVIDER:-direct}"
+  if [[ "${1:-}" == "--provider" ]]; then
+    [[ $# -ge 2 ]] || { echo "--provider demande direct|sdkmanager|local" >&2; exit 2; }
+    provider=$2; shift 2
+  fi
+  case "$provider" in
+    direct)
+      (($# == 0)) || { echo "provider direct n'accepte pas ces options: $*" >&2; exit 2; }
+      download_direct_host
+      ;;
+    local)
+      (($# == 0)) || { echo "provider local n'accepte pas ces options: $*" >&2; exit 2; }
+      download_local_validate
+      ;;
+    sdkmanager)
+      compose_flash download --provider sdkmanager "$@"
+      ;;
+    *) echo "provider inconnu: $provider (attendu direct|sdkmanager|local)" >&2; exit 2 ;;
+  esac
+}
+
+flash_cmd() {
+  local sub=${1:-doctor}; shift || true
+  case "$sub" in
+    image) build_sdkmanager_image ;;
+    image-status) sdkmanager_image_state ;;
+    sdkmanager-version)
+      [[ "$(sdkmanager_image_state)" == READY ]] || {
+        echo 'SDK Manager image is not READY: run ./jetsonctl flash image' >&2
+        return 2
+      }
+      docker run --rm --entrypoint sdkmanager "$SDK_MANAGER_IMAGE" --ver
+      ;;
+    doctor)
+      "$ROOT/flash/host-preflight.sh"
+      local runtime_state
+      runtime_state=$(sdkmanager_image_state)
+      echo "Flash runtime image: $runtime_state"
+      if [[ "$runtime_state" == READY ]]; then
+        VOLUME="$VOLUME" docker compose -f "$ROOT/flash/compose.yaml" run --rm --user 0:0 sdkm doctor
+      else
+        echo 'Container doctor skipped; flash runtime image is not READY.'
+      fi
+      ;;
+    diagnose) VOLUME="$VOLUME" "$ROOT/flash/diagnose.sh" "$@" ;;
+    enter-recovery)
+      local recovery_ssh_host="${RECOVERY_SSH_HOST:-192.168.55.1}"
+      local recovery_ssh_user="${RECOVERY_SSH_USER:-jetson}"
+      local recovery_ssh_identity="${RECOVERY_SSH_IDENTITY:-}"
+      local recovery_auto_timeout="${RECOVERY_AUTO_TIMEOUT:-90}"
+      local recovery_manual_wait=0
+
+      while (($#)); do
+        case "$1" in
+          --recovery-ssh-host|--host)
+            [[ $# -ge 2 ]] || { echo "$1 demande HOST" >&2; exit 2; }
+            recovery_ssh_host=$2; shift 2 ;;
+          --recovery-ssh-user|--user)
+            [[ $# -ge 2 ]] || { echo "$1 demande USER" >&2; exit 2; }
+            recovery_ssh_user=$2; shift 2 ;;
+          --recovery-ssh-key|--identity)
+            [[ $# -ge 2 ]] || { echo "$1 demande PATH" >&2; exit 2; }
+            recovery_ssh_identity=$2; shift 2 ;;
+          --timeout)
+            [[ $# -ge 2 ]] || { echo "--timeout demande SEC" >&2; exit 2; }
+            recovery_auto_timeout=$2; shift 2 ;;
+          --wait-manual)
+            recovery_manual_wait=1; shift ;;
+          -h|--help)
+            cat <<'EOF_RECOVERY'
+usage: ./jetsonctl flash enter-recovery [options]
+
+Options:
+  --recovery-ssh-host HOST | --host HOST
+  --recovery-ssh-user USER | --user USER
+  --recovery-ssh-key PATH  | --identity PATH
+  --timeout SEC
+  --wait-manual   after automatic failure, keep waiting for manual APX/RCM
+EOF_RECOVERY
+            return 0 ;;
+          *) echo "option enter-recovery inconnue: $1" >&2; exit 2 ;;
+        esac
+      done
+
+      RECOVERY_SSH_HOST="$recovery_ssh_host" \
+      RECOVERY_SSH_USER="$recovery_ssh_user" \
+      RECOVERY_SSH_IDENTITY="$recovery_ssh_identity" \
+      RECOVERY_AUTO_TIMEOUT="$recovery_auto_timeout" \
+      RECOVERY_MANUAL_FALLBACK_WAIT="$recovery_manual_wait" \
+      AUTO_FORCE_RECOVERY=1 \
+        with_host_flash_guard recovery true
+      ;;
+    plan) compose_flash plan "$@" ;;
+    download) flash_download "$@" ;;
+    prepare|validate-rootfs|create-user|mark-dirty)
+      compose_flash "$sub" "$@" ;;
+    generate-images)
+      with_host_flash_guard generate compose_flash generate-images "$@"
+      ;;
+    flash-only)
+      with_host_flash_guard flash compose_flash flash-only "$@"
+      ;;
+    nvme)
+      export FLASH_TARGET=nvme
+      if [[ "${1:-}" == "--reuse-images" ]]; then with_host_flash_guard flash compose_flash flash-only; else with_host_flash_guard flash compose_flash flash; fi
+      ;;
+    internal)
+      export FLASH_TARGET=internal
+      if [[ "${1:-}" == "--reuse-images" ]]; then with_host_flash_guard flash compose_flash flash-only; else with_host_flash_guard flash compose_flash flash; fi
+      ;;
+    shell) compose_flash shell ;;
+    *) echo "flash subcommand inconnu: $sub" >&2; exit 2 ;;
+  esac
+}
+
+case "${1:-help}" in
+  profile)
+    echo "PROFILE=$PROFILE"
+    echo "JETSON_PLATFORM=${PLATFORM_NAME:-${JETSON_PLATFORM:-unknown}}"
+    echo "VOLUME=$VOLUME"
+    echo "CACHE_ROOT=$CACHE_ROOT"
+    echo "CARGO_CACHE_DIR=$CARGO_CACHE_DIR"
+    echo "MISTRALRS_TARGET_DIR=$MISTRALRS_TARGET_DIR"
+    echo "BUILDKIT_CACHE_DIR=$BUILDKIT_CACHE_DIR"
+    env | grep -E '^(PLATFORM_NAME|PLATFORM_FAMILY|PLATFORM_MODEL|PLATFORM_HARDWARE_TESTED|PROFILE_NAME|JETPACK|L4T|BOARD|SOC|RECOVERY_USB_PRODUCTS|FLASH_LAYOUT|CUDA_VERSION|CUDA_COMPUTE_CAP|CUDA_CROSS_PLATFORM|CUDA_CROSS_REPO|CROSS_IMAGE|MISTRALRS_REPO|MISTRALRS_REF|MISTRALRS_FEATURES|SDK_MANAGER_BOOTSTRAP_IMAGE|SDK_MANAGER_APT_DISTRO|SDK_MANAGER_APT_VERSION_PREFIX|SDK_MANAGER_IMAGE|DOWNLOAD_PROVIDER|L4T_DIRECT_BASE_URL|FLASH_TARGET|FLASH_ROOTDEV|FLASH_ERASE_ALL|EXTERNAL_DEVICE|NATIVE_CUDA_COMPAT_PACKAGE|NATIVE_CUDA_COMPAT_DIR)=' | sort
+    ;;
+  platform) shift; platform_cmd "$@" ;;
+  cache)
+    case "${2:-status}" in
+      status|paths) cache_status ;;
+      clean) cache_clean "${3:-}" ;;
+      *) echo "usage: jetsonctl cache [status|clean ...]" >&2; exit 2 ;;
+    esac
+    ;;
+  secrets)
+    case "${2:-status}" in
+      status) secrets_status ;;
+      install) secrets_install ;;
+      doctor) secrets_doctor ;;
+      build-resolver) secrets_build_resolver ;;
+      set-password) secrets_set_named JETSON_PASSWORD headless ;;
+      set-wifi) secrets_set_named WIFI_PSK headless ;;
+      set-github-token) secrets_set_named GITHUB_TOKEN cross ;;
+      set-ghcr-token) secrets_set_named GHCR_TOKEN cross ;;
+      password-file) secrets_password_file ;;
+      wifi-encrypt) secrets_wifi_encrypt ;;
+      *) echo "usage: jetsonctl secrets {status|install|doctor|build-resolver|set-password|set-wifi|set-github-token|set-ghcr-token|password-file|wifi-encrypt}" >&2; exit 2 ;;
+    esac
+    ;;
+  native-sdk)
+    case "${2:-status}" in
+      status) compose_flash native-sdk-status ;;
+      apply) compose_flash native-sdk-apply ;;
+      *) echo "usage: jetsonctl native-sdk {status|apply}" >&2; exit 2 ;;
+    esac
+    ;;
+  custom)
+    case "${2:-show}" in
+      init) custom_init ;;
+      show) custom_show ;;
+      status) custom_init >/dev/null; compose_flash custom-status ;;
+      apply) custom_init >/dev/null; compose_flash custom-apply ;;
+      dirty) compose_flash mark-dirty ;;
+      *) echo "usage: jetsonctl custom {init|show|status|apply|dirty}" >&2; exit 2 ;;
+    esac
+    ;;
+  build-image) [[ "${2:-cross}" == cross ]] && build_cross_image || { echo "usage: jetsonctl build-image cross" >&2; exit 2; } ;;
+  cross-image-status) cross_image_state ;;
+  gate) [[ "${2:-}" == cross ]] && audit_cross_image || { echo "usage: jetsonctl gate cross" >&2; exit 2; } ;;
+  source) [[ "${2:-}" == mistralrs ]] && source_mistralrs || { echo "usage: jetsonctl source mistralrs" >&2; exit 2; } ;;
+  build) [[ "${2:-}" == mistralrs ]] && build_mistralrs || { echo "usage: jetsonctl build mistralrs" >&2; exit 2; } ;;
+  cross)
+    case "${2:-}" in
+      cargo) shift 2; cross_cargo "$@" ;;
+      deploy) shift 2; cross_deploy "$@" ;;
+      *) echo "usage: jetsonctl cross {cargo|deploy} ..." >&2; exit 2 ;;
+    esac
+    ;;
+  target)
+    case "${2:-}" in
+      gate) shift 2; target_gate "$@" ;;
+      *) echo "usage: jetsonctl target gate --host HOST --user USER [--identity KEY]" >&2; exit 2 ;;
+    esac
+    ;;
+  host)
+    shift
+    [[ "${1:-}" == usb ]] || { echo "usage: jetsonctl host usb {status|fix|restore}" >&2; exit 2; }
+    shift
+    host_usb_cmd "$@"
+    ;;
+  flash) shift; flash_cmd "$@" ;;
+  help|-h|--help)
+    cat <<EOF
+usage:
+  ./jetsonctl platform list
+  ./jetsonctl platform current
+  ./jetsonctl platform show NAME
+  ./jetsonctl --platform orin-nano-super profile
+  ./jetsonctl profile
+  ./jetsonctl cache status
+  ./jetsonctl build-image cross
+  ./jetsonctl gate cross
+  ./jetsonctl source mistralrs
+  ./jetsonctl build mistralrs
+  ./jetsonctl cross cargo --platform PLATFORM --repo URL --ref REF --package PKG --bin BIN --features LIST
+  ./jetsonctl cross deploy --artifact PATH --host HOST --user USER [--identity KEY]
+  ./jetsonctl target gate --host HOST --user USER [--identity KEY]
+
+  ./jetsonctl native-sdk status
+  ./jetsonctl native-sdk apply
+
+  ./jetsonctl custom init
+  ./jetsonctl custom show
+  ./jetsonctl custom status
+  ./jetsonctl custom apply
+  ./jetsonctl custom dirty
+
+  ./jetsonctl secrets status
+  ./jetsonctl secrets install
+  ./jetsonctl secrets doctor
+  ./jetsonctl secrets set-password
+  ./jetsonctl secrets set-wifi
+  ./jetsonctl secrets set-github-token
+  ./jetsonctl secrets set-ghcr-token
+  ./jetsonctl secrets build-resolver
+  ./jetsonctl secrets wifi-encrypt      # legacy
+  ./jetsonctl secrets password-file     # legacy
+
+  ./jetsonctl flash image
+  ./jetsonctl flash image-status
+  ./jetsonctl flash sdkmanager-version   # read-only version check; no image build
+  ./jetsonctl host usb status
+  ./jetsonctl host usb fix [--wait-recovery]
+  ./jetsonctl host usb restore
+
+  ./jetsonctl flash doctor
+  ./jetsonctl flash diagnose [--fix]
+  ./jetsonctl flash enter-recovery
+  ./jetsonctl flash download [--provider direct|sdkmanager|local]
+  ./jetsonctl flash download --provider sdkmanager --query
+  ./jetsonctl flash download --provider sdkmanager [--select TITLE] [--deselect TITLE] [--additional-sdk TITLE]
+  ./jetsonctl flash prepare [--reset]
+  ./jetsonctl flash plan
+  ./jetsonctl flash create-user
+  ./jetsonctl flash generate-images
+  ./jetsonctl flash nvme
+  ./jetsonctl flash nvme --reuse-images
+
+  ./jetsonctl headless-flash [options]
+  ./jetsonctl headless-flash --secret-settings [options]
+  ./jetsonctl headless-flash --dry-run --secret-settings [options]
+
+variables principales:
+  JETSON_PLATFORM=...        plateforme intégrée (orin-nano-super par défaut)
+  --platform NAME            sélecteur global; accepté à n'importe quelle position
+  PROFILE=...                profil .env avancé/personnalisé
+  VOLUME=...                 données persistantes hors ZIP
+  CACHE_ROOT=...              racine des caches explicites (défaut: $VOLUME/cache)
+  CARGO_CACHE_DIR=...         Cargo registry/git (défaut: $CACHE_ROOT/cargo-home)
+  CARGO_TARGET_ROOT=...       builds Cargo (défaut: $CACHE_ROOT/cargo-target)
+  BUILDKIT_CACHE_DIR=...      cache BuildKit local exporté (défaut: $CACHE_ROOT/buildkit)
+  MISTRALRS_REPO=...         fork éventuel
+  MISTRALRS_REF=...          branche, tag ou SHA
+  MISTRALRS_SOURCE_DIR=...   checkout local optionnel
+  JETSON_SYSROOT=...         sysroot target (défaut: $VOLUME/downloads/Linux_for_Tegra/rootfs)
+  NATIVE_CUDA_ENABLE=1      installe le SDK CUDA target dans le rootfs avant flash
+
+custom/rootfs persistants:
+  $VOLUME/custom              packages, overlay, services, hooks
+  $VOLUME/secrets             sources legacy/fichiers explicites seulement (fix15 préfère keyring)
+
+secrets (fix15/fix16):
+  SecretSpec 0.20             contrat/résolution; provider host par défaut = keyring
+  systemd-credential          provider runtime Jetson pour les services systemd
+  secrecy 0.10.3             protection des valeurs dans le resolver Rust
+  precedence headless         option CLI explicite > SecretSpec/keyring > prompt (password)
+  secrets set-password       stocke JETSON_PASSWORD dans le keyring sans argv secret
+  secrets set-wifi           stocke WIFI_PSK dans le keyring sans argv secret
+  secrets password-file      compatibilité legacy uniquement
+  secrets wifi-encrypt       compatibilité legacy uniquement
+  headless --secret-settings build/set/status/doctor uniquement si nécessaire
+
+flash:
+  FLASH_ROOTDEV=external      rootdev explicite pour NVMe
+  FLASH_ERASE_ALL=1           effacement complet du média cible (défaut)
+  ALLOW_STALE_IMAGES=0        refuse flash-only si le rootfs a changé
+EOF
+    ;;
+  *) echo "commande inconnue: $1" >&2; exit 2 ;;
+esac

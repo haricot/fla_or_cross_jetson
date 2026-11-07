@@ -1,0 +1,31 @@
+name: V2-R1 SDK Manager 26.1 and reliability (non-destructive)
+
+on:
+  push:
+    branches: [v2-r1-sdkmanager-261-hardening]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  static-and-synthetic:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify pinned fix17 sources and R1 updates
+        run: sha256sum --check SHA256SUMS
+      - name: Validate Bash syntax
+        shell: bash
+        run: |
+          bash -n jetsonctl
+          find . -name '*.sh' -type f -print0 | xargs -0 -r -n1 bash -n
+      - name: Prepare synthetic legacy /work directory
+        run: sudo install -d -o "$(id -un)" -g "$(id -gn)" -m 0755 /work /work/tmp /work/tmp/state
+      - name: Run cumulative fix17 and R1 synthetic gates
+        run: ./gates/audit-r1.sh
+      - name: Check Rust SecretSpec resolver
+        run: cargo check --manifest-path secret-plane/Cargo.toml
