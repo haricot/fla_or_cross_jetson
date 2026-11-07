@@ -28,6 +28,7 @@ deb [arch=arm64 signed-by=/usr/share/keyrings/ubuntu-archive-keyring.gpg] https:
 deb [arch=arm64 signed-by=/usr/share/keyrings/ubuntu-archive-keyring.gpg] https://ports.ubuntu.com/ubuntu-ports noble-updates main universe
 deb [arch=arm64 signed-by=/usr/share/keyrings/ubuntu-archive-keyring.gpg] https://ports.ubuntu.com/ubuntu-ports noble-security main universe
 deb [arch=arm64 signed-by=$apt_workdir/nvidia-jetson.gpg] https://repo.download.nvidia.com/jetson/common r39.2 main
+deb [arch=arm64 signed-by=$apt_workdir/nvidia-jetson.gpg] https://repo.download.nvidia.com/jetson/som r39.2 main
 EOF
 
 apt_opts=(
