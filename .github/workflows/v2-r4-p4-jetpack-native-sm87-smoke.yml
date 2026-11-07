@@ -24,7 +24,7 @@ jobs:
         run: |
           set -Eeuo pipefail
           gcc -std=c11 -Wall -Wextra -Werror -fsyntax-only tools/v2-r4-p4/jetpack_sm87_smoke.c
-          bash -n tools/v2-r4-p4/{prepare_host_cuobjdump,extract_r4p2_sm87,run-smoke}.sh
+          bash -n tools/v2-r4-p4/{prepare_host_cuobjdump,prepare_driver_link_stub,extract_r4p2_sm87,run-smoke}.sh
           python3 -m unittest discover -s tools/v2-r4-p3 -p 'test_*.py' -v
       - name: Reuse proven CUDA 13.2 AArch64 SM87 binary from R4-P2
         uses: actions/download-artifact@v4
@@ -48,7 +48,8 @@ jobs:
         shell: bash
         run: |
           set -Eeuo pipefail
-          bash tools/v2-r4-p3/prepare_thin_sysroot.sh r4-p4-out/target
+          # R4-P4 uses the CUDA Driver API, so do not download 484 MB cuBLAS.
+          bash tools/v2-r4-p3/prepare_thin_sysroot.sh r4-p4-out/target --driver-only
       - name: Download NVIDIA signed x86 CUDA 13.2 cuobjdump (no APT install)
         shell: bash
         run: |
@@ -65,6 +66,11 @@ jobs:
           file r4-p4-out/package/saxpy-sm87.cubin
           sha256sum r4-p4-out/package/saxpy-sm87.cubin \
             > r4-p4-out/evidence/sm87-cubin-sha256.txt
+      - name: Download signed JetPack ARM64 CUDA driver link stub
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          bash tools/v2-r4-p4/prepare_driver_link_stub.sh r4-p4-out/link-stub
       - name: Link original SM87 device code to JetPack-native AArch64 host via Driver ABI
         shell: bash
         run: |
@@ -72,11 +78,23 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends \
             gcc-aarch64-linux-gnu libc6-dev-arm64-cross
+          # Link against NVIDIA's SDK stub, as recommended for CUDA driver
+          # clients. Real libcuda has transitive NvRm dependencies which the
+          # intentionally thin ABI sysroot doesn't try to reconstruct.
+          driver_stub=$(cat r4-p4-out/link-stub/evidence/stub-path.txt)
+          test -e "$driver_stub"
           driver_so=$(find r4-p4-out/target/sysroot -type f -name 'libcuda.so*' -print -quit)
           test -n "$driver_so"
+          readelf -Ws "$driver_so" > r4-p4-out/evidence/target-driver-dynsym.txt
+          for symbol in cuInit cuDeviceGet cuModuleLoad cuLaunchKernel cuMemAlloc_v2 cuMemcpyDtoH_v2; do
+            grep -q "$symbol" r4-p4-out/evidence/target-driver-dynsym.txt || {
+              echo "R4_P4_REJECT=TARGET_DRIVER_MISSING_$symbol" >&2
+              exit 1
+            }
+          done
           aarch64-linux-gnu-gcc -std=c11 -O2 -Wall -Wextra -Werror -fPIE -pie \
             -o r4-p4-out/package/jetpack-sm87-smoke \
-            tools/v2-r4-p4/jetpack_sm87_smoke.c "$driver_so"
+            tools/v2-r4-p4/jetpack_sm87_smoke.c "$driver_stub"
           readelf -d r4-p4-out/package/jetpack-sm87-smoke | grep -q 'Shared library: \[libcuda.so.1\]'
           python3 tools/v2-r4-p3/elf_abi_gate.py \
             --binary r4-p4-out/package/jetpack-sm87-smoke \
@@ -126,6 +144,7 @@ jobs:
             r4-p4-out/evidence/
             r4-p4-out/target/evidence/
             r4-p4-out/host-tools/evidence/
+            r4-p4-out/link-stub/evidence/
             r4-p4-out/package/original-fatbin.txt
           if-no-files-found: warn
           retention-days: 30
