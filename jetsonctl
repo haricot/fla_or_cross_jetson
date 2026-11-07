@@ -991,6 +991,13 @@ flash_cmd() {
   case "$sub" in
     image) build_sdkmanager_image ;;
     image-status) sdkmanager_image_state ;;
+    sdkmanager-version)
+      [[ "$(sdkmanager_image_state)" == READY ]] || {
+        echo 'SDK Manager image is not READY: run ./jetsonctl flash image' >&2
+        return 2
+      }
+      docker run --rm --entrypoint sdkmanager "$SDK_MANAGER_IMAGE" --ver
+      ;;
     doctor)
       "$ROOT/flash/host-preflight.sh"
       local runtime_state
@@ -1188,6 +1195,7 @@ usage:
 
   ./jetsonctl flash image
   ./jetsonctl flash image-status
+  ./jetsonctl flash sdkmanager-version   # read-only version check; no image build
   ./jetsonctl host usb status
   ./jetsonctl host usb fix [--wait-recovery]
   ./jetsonctl host usb restore

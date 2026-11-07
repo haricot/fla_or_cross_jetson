@@ -4,6 +4,24 @@
 SYSFS_ROOT=${SYSFS_ROOT:-/sys}
 RECOVERY_USB_PRODUCTS=${RECOVERY_USB_PRODUCTS:-7523,7623}
 L4T_GADGET_USB_PRODUCTS=${L4T_GADGET_USB_PRODUCTS-7020}
+USB_DEV_ROOT=${USB_DEV_ROOT:-/dev/bus/usb}
+
+# Containers may expose a recovery device via sysfs without its /dev/bus/usb
+# character node. Such a phantom must not be accepted as usable for RCM.
+usb_devnode_for_sysfs() {
+  local sysdev=${1:-} bus dev
+  [[ -r "$sysdev/busnum" && -r "$sysdev/devnum" ]] || return 1
+  bus=$(cat "$sysdev/busnum")
+  dev=$(cat "$sysdev/devnum")
+  [[ "$bus" =~ ^[0-9]+$ && "$dev" =~ ^[0-9]+$ ]] || return 1
+  printf '%s/%03d/%03d\n' "$USB_DEV_ROOT" "$((10#$bus))" "$((10#$dev))"
+}
+
+usb_devnode_available() {
+  local node
+  node=$(usb_devnode_for_sysfs "$1") || return 1
+  [[ -c "$node" ]]
+}
 
 recovery_product_list() {
   printf '%s\n' "${RECOVERY_USB_PRODUCTS//,/ }"

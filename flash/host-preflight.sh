@@ -73,8 +73,12 @@ if [[ -c /dev/loop-control ]]; then
 else
   echo 'Host loop devices: NEEDS FIX (/dev/loop-control absent; Smart Host Guard will attempt modprobe loop)'
 fi
-if discover_recovery_sysfs >/dev/null 2>&1; then
+recovery_dev=$(discover_recovery_sysfs 2>/dev/null || true)
+if [[ -n "$recovery_dev" ]] && usb_devnode_available "$recovery_dev"; then
   echo 'Jetson recovery USB: PASS'
+elif [[ -n "$recovery_dev" ]]; then
+  echo 'Jetson recovery USB: BLOCKED (sysfs present but /dev/bus/usb node missing)' >&2
+  exit 3
 elif discover_l4t_sysfs >/dev/null 2>&1; then
   echo 'Jetson recovery USB: WRONG MODE'
   echo 'Software recovery: ELIGIBLE (L4T USB gadget)'

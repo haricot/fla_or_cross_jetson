@@ -3,7 +3,7 @@ ARG SDK_MANAGER_BOOTSTRAP_IMAGE=ubuntu:24.04
 FROM ${SDK_MANAGER_BOOTSTRAP_IMAGE}
 
 ARG SDK_MANAGER_APT_DISTRO=ubuntu2404
-ARG SDK_MANAGER_APT_VERSION_PREFIX=2.4.1
+ARG SDK_MANAGER_APT_VERSION_PREFIX=26.1
 ARG SDK_MANAGER_IMAGE_FINGERPRINT=unknown
 
 USER root
@@ -20,14 +20,25 @@ RUN apt-get update \
     && rm -f /tmp/cuda-keyring.deb \
     && rm -rf /var/lib/apt/lists/*
 
-# Pin SDK Manager to the requested 2.4.1 package family.
-RUN apt-get update \
-    && sdkm_version="$(apt-cache madison sdkmanager | awk -v p="${SDK_MANAGER_APT_VERSION_PREFIX}" 'index($3,p)==1 {print $3; exit}')" \
-    && test -n "$sdkm_version" \
-    && printf 'Selected SDK Manager package: %s\n' "$sdkm_version" \
-    && apt-get install -y --no-install-recommends "sdkmanager=${sdkm_version}" \
-    && dpkg-query -W -f='Installed SDK Manager: ${Version}\n' sdkmanager \
-    && rm -rf /var/lib/apt/lists/*
+# Pin the exact requested version family (26.1 default; 2.4.1 for explicit rollback).
+# Fail closed when APT has not published that release for this distribution.
+RUN set -eu; \
+    apt-get update; \
+    sdkm_candidates="$(apt-cache madison sdkmanager)"; \
+    sdkm_version="$(printf '%s\n' "$sdkm_candidates" | awk -v p="$SDK_MANAGER_APT_VERSION_PREFIX" 'index($3,p)==1 {print $3; exit}')"; \
+    if [ -z "$sdkm_version" ]; then \
+      printf 'ERROR: SDK Manager %s not available from NVIDIA APT repo %s.\nAvailable versions:\n%s\n' \
+        "$SDK_MANAGER_APT_VERSION_PREFIX" "$SDK_MANAGER_APT_DISTRO" "$sdkm_candidates" >&2; \
+      exit 12; \
+    fi; \
+    printf 'Selected SDK Manager package: %s\n' "$sdkm_version"; \
+    apt-get install -y --no-install-recommends "sdkmanager=$sdkm_version"; \
+    installed="$(dpkg-query -W -f='${Version}' sdkmanager)"; \
+    case "$installed" in "$SDK_MANAGER_APT_VERSION_PREFIX"*) ;; \
+      *) printf 'ERROR: SDK Manager expected %s, installed %s\n' "$SDK_MANAGER_APT_VERSION_PREFIX" "$installed" >&2; exit 13 ;; \
+    esac; \
+    printf 'Installed SDK Manager: %s\n' "$installed"; \
+    rm -rf /var/lib/apt/lists/*
 
 # Runtime tools required by L4T/initrd flash. Service start is deliberately
 # suppressed while building the image; rpcbind/NFS/udev are started or used

@@ -8,8 +8,8 @@ variable "CROSS_IMAGE" { default = "fla-or-cross-jetson:jp721-cuda133" }
 variable "CROSS_IMAGE_FINGERPRINT" { default = "unknown" }
 variable "SDK_MANAGER_BOOTSTRAP_IMAGE" { default = "ubuntu:24.04" }
 variable "SDK_MANAGER_APT_DISTRO" { default = "ubuntu2404" }
-variable "SDK_MANAGER_APT_VERSION_PREFIX" { default = "2.4.1" }
-variable "SDK_MANAGER_IMAGE" { default = "fla-or-cross-jetson-sdkm:jp721" }
+variable "SDK_MANAGER_APT_VERSION_PREFIX" { default = "26.1" }
+variable "SDK_MANAGER_IMAGE" { default = "fla-or-cross-jetson-sdkm:jp721-sdkm261" }
 variable "SDK_MANAGER_IMAGE_FINGERPRINT" { default = "unknown" }
 
 target "cross" {

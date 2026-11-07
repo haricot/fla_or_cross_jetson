@@ -6,6 +6,19 @@ Cible matériellement validée : **JetPack 7.2.1 / Jetson Linux R39.2.1 / Jetson
 
 La V2 garde le gate cross CUDA 13.3/sm87 déjà validé et fix14 étend le Generic Cross à sm110 pour Thor. `alpha4-fix8` conserve les providers, le **Smart Host Flash Guard**, la détection APX stricte et ajoute une bascule logicielle automatique vers Force Recovery lorsqu'un Jetson déjà booté est visible comme gadget L4T USB.
 
+## V2-R1 — SDK Manager 26.1 (branche de fiabilisation)
+
+Cette branche sélectionne **SDK Manager 26.1** par défaut, sans changer le BSP JetPack 7.2.1 / L4T R39.2.1 ni la toolchain CUDA 13.3 de fix17. L'image SDK Manager utilise un nouveau tag (`:jp721-sdkm261`) pour conserver l'ancienne 2.4.1. La disponibilité de 26.1 dans le dépôt APT NVIDIA est contrôlée explicitement ; aucune substitution silencieuse n'est autorisée.
+
+```sh
+./jetsonctl flash image-status
+./jetsonctl flash image               # construction explicite du conteneur
+./jetsonctl flash sdkmanager-version  # version du client dans l'image READY
+./gates/audit-r1.sh                 # validations non destructives
+```
+
+Le chemin NFS/RPC/IPv6 reste en place. Le contrôle host recovery refuse désormais un périphérique APX détecté uniquement via sysfs si son nœud USB dans `/dev/bus/usb` est absent. Pour revenir temporairement à SDK Manager 2.4.1, définir **les deux** variables `SDK_MANAGER_APT_VERSION_PREFIX=2.4.1` et `SDK_MANAGER_IMAGE=fla-or-cross-jetson-sdkm:jp721`. Voir [docs/V2-R1-SDKMANAGER-261.md](docs/V2-R1-SDKMANAGER-261.md).
+
 
 ## alpha4-fix17 — SecretSpec EOF-safe staging
 

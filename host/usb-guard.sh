@@ -126,10 +126,12 @@ wait_recovery() {
   local deadline=$((SECONDS + TIMEOUT)) dev
   while (( SECONDS < deadline )); do
     dev=$(discover_recovery_sysfs 2>/dev/null || true)
-    if [[ -n "$dev" ]]; then
+    if [[ -n "$dev" ]] && usb_devnode_available "$dev"; then
       snapshot_and_power_path "$dev" || true
-      log "Jetson Force Recovery: PASS (${dev##*/})"
+      log "Jetson Force Recovery: PASS (${dev##*/}; $(usb_devnode_for_sysfs "$dev"))"
       return 0
+    elif [[ -n "$dev" ]]; then
+      log "Jetson APX visible in sysfs but /dev/bus/usb node is missing; waiting (container mapping?)."
     fi
     log "Waiting for Jetson Force Recovery USB (APX PID: $(recovery_product_list | xargs))..."
     sleep "$INTERVAL"
