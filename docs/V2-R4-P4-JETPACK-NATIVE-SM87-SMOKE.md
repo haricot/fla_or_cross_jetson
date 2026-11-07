@@ -4,6 +4,19 @@ Branch: `v2-r4-p4-jetpack-native-sm87-smoke`, based on the R4-P3
 JetPack 7.2.1 ABI audit. Target: Jetson Orin Nano Super, AArch64, SM87,
 JetPack 7.2.1 / Jetson Linux 39.2.1 / Ubuntu 24.04, CUDA 13.2 family.
 
+Status (2026-11-07): **PASS_REUSED_SM87_CUBIN / PASS_ARM64_DRIVER_LINK /
+PASS_STATIC_ABI / DEVICE_EXECUTION_PENDING**.
+
+- [Green R4-P4 GitHub Actions #42403460940](https://github.com/haricot/fla_or_cross_jetson/actions/runs/42403460940)
+- [Ready-to-run ARM64 smoke bundle, expires 2026-12-07](https://github.com/haricot/fla_or_cross_jetson/actions/runs/42403460940/artifacts/13586746455)
+- [Signed APT manifests, ELF ABI reports and SHA256 evidence](https://github.com/haricot/fla_or_cross_jetson/actions/runs/42403460940/artifacts/13585899311)
+
+The final run reports `R4_P4_REUSED_R4_P2_SM87_CUBIN=PASS_EXTRACTED_NO_NVCC`,
+`R4_P4_JETPACK_NATIVE_ARM64_DRIVER_ABI=PASS_STATIC` and
+`R4_P4_JETSON_SMOKE_BUNDLE=READY_NOT_EXECUTED`. The `--driver-only` subset
+reduces signed APT downloads from 509,937,952 bytes in R4-P3 to
+26,045,990 bytes for this Driver API-only test.
+
 ## Objective
 
 Produce a **JetPack-linked ARM64 host application** that loads a **real SM87
@@ -40,7 +53,8 @@ The R4-P2 cubin is independent of the host ELF in R4-P4. We are not
 ## On-device smoke procedure (only after JetPack boots)
 
 No root access or flash is required to run the bundle. Download the R4-P4
-GitHub Actions artifact onto the Jetson, then:
+GitHub Actions artifact onto the Jetson. The GitHub artifact arrives as a ZIP
+containing `jetpack-native-sm87-smoke.tar.gz`. Extract that ZIP, then:
 
 ```bash
 tar -xzf jetpack-native-sm87-smoke.tar.gz
