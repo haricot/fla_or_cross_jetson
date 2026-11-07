@@ -4,10 +4,15 @@
 # No package is installed, no BSP is applied, and no device is flashed.
 set -Eeuo pipefail
 
-if [[ $# -ne 1 ]]; then
-  echo "Usage: $0 OUTPUT_DIRECTORY" >&2
+if [[ $# -lt 1 || $# -gt 2 ]]; then
+  echo "Usage: $0 OUTPUT_DIRECTORY [--driver-only]" >&2
   exit 2
 fi
+mode=${2:---full}
+[[ "$mode" == --full || "$mode" == --driver-only ]] || {
+  echo "Unknown ABI subset mode: $mode" >&2
+  exit 2
+}
 
 out_dir=$(realpath -m -- "$1")
 mkdir -p "$out_dir/debs" "$out_dir/sysroot" "$out_dir/evidence"
@@ -44,9 +49,11 @@ apt_opts=(
 apt-get "${apt_opts[@]}" update
 packages=(
   libc6 libgcc-s1 libstdc++6
-  cuda-cudart-13-2 libcublas-13-2
   nvidia-l4t-cuda nvidia-l4t-cuda-nvgpu
 )
+if [[ "$mode" == --full ]]; then
+  packages+=(cuda-cudart-13-2 libcublas-13-2)
+fi
 apt-cache "${apt_opts[@]}" policy "${packages[@]}" > "$out_dir/evidence/apt-policy.txt"
 
 # Guard against accidentally downloading gigabytes when NVIDIA changes a
@@ -107,10 +114,12 @@ echo 'R4_P3_UBUNTU_MERGED_USR_ARM64_LOADER=RESOLVED'
 
 test -e "$out_dir/sysroot/lib/aarch64-linux-gnu/libc.so.6" \
   || test -e "$out_dir/sysroot/usr/lib/aarch64-linux-gnu/libc.so.6"
-test -n "$(find "$out_dir/sysroot" -name 'libcudart.so*' -print -quit)"
-test -n "$(find "$out_dir/sysroot" -name 'libcublas.so*' -print -quit)"
-test -n "$(find "$out_dir/sysroot" -name 'libcublasLt.so*' -print -quit)"
+if [[ "$mode" == --full ]]; then
+  test -n "$(find "$out_dir/sysroot" -name 'libcudart.so*' -print -quit)"
+  test -n "$(find "$out_dir/sysroot" -name 'libcublas.so*' -print -quit)"
+  test -n "$(find "$out_dir/sysroot" -name 'libcublasLt.so*' -print -quit)"
+fi
 test -n "$(find "$out_dir/sysroot" -name 'libcuda.so*' -print -quit)"
 tar -C "$out_dir/sysroot" -czf "$out_dir/jetpack721-thin-sysroot.tgz" .
-echo "R4_P3_THIN_SYSROOT=PREPARED_SIGNED_APT_ARM64_JP721"
+echo "R4_P3_THIN_SYSROOT=PREPARED_SIGNED_APT_ARM64_JP721 mode=$mode"
 du -sh "$out_dir/sysroot" "$out_dir/debs" "$out_dir/jetpack721-thin-sysroot.tgz"

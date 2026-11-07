@@ -1,0 +1,150 @@
+name: V2-R4-P4 JetPack-native SM87 link and device smoke bundle (no flash)
+
+on:
+  push:
+    branches: [v2-r4-p4-jetpack-native-sm87-smoke]
+    paths:
+      - 'tools/v2-r4-p4/**'
+      - '.github/workflows/v2-r4-p4-jetpack-native-sm87-smoke.yml'
+      - 'tools/v2-r4-p3/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  sm87-jetpack-native-link:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check C host source and shell scripts before signed downloads
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          gcc -std=c11 -Wall -Wextra -Werror -fsyntax-only tools/v2-r4-p4/jetpack_sm87_smoke.c
+          bash -n tools/v2-r4-p4/{prepare_host_cuobjdump,prepare_driver_link_stub,extract_r4p2_sm87,run-smoke}.sh
+          python3 -m unittest discover -s tools/v2-r4-p3 -p 'test_*.py' -v
+      - name: Reuse proven CUDA 13.2 AArch64 SM87 binary from R4-P2
+        uses: actions/download-artifact@v4
+        with:
+          name: r4-p2-sm87-elf-abi-evidence
+          path: r4-p2-input
+          run-id: 42399023587
+          github-token: ${{ github.token }}
+      - name: Verify the original R4-P2 cubin proof before extraction
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          test -s r4-p2-input/saxpy-aarch64-cuda132-sm87
+          readelf -h r4-p2-input/saxpy-aarch64-cuda132-sm87 | grep -Eq 'Machine:.*AArch64'
+          grep -q 'sm_87' r4-p2-input/cuobjdump-list-elf.txt
+          mkdir -p r4-p4-out/evidence
+          sha256sum r4-p2-input/saxpy-aarch64-cuda132-sm87 \
+            > r4-p4-out/evidence/r4-p2-source-sha256.txt
+          echo 'R4_P4_R4_P2_PROOF=REUSED_NO_CUDA_REBUILD'
+      - name: Download signed JetPack 7.2.1 ARM64 runtime ABI (no APT install)
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          # R4-P4 uses the CUDA Driver API, so do not download 484 MB cuBLAS.
+          bash tools/v2-r4-p3/prepare_thin_sysroot.sh r4-p4-out/target --driver-only
+      - name: Download NVIDIA signed x86 CUDA 13.2 cuobjdump (no APT install)
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          bash tools/v2-r4-p4/prepare_host_cuobjdump.sh r4-p4-out/host-tools
+      - name: Extract original verified SM87 cubin without recompiling CUDA
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          tool=$(cat r4-p4-out/host-tools/evidence/cuobjdump-path.txt)
+          bash tools/v2-r4-p4/extract_r4p2_sm87.sh \
+            "$tool" r4-p2-input/saxpy-aarch64-cuda132-sm87 \
+            r4-p4-out/package/saxpy-sm87.cubin
+          file r4-p4-out/package/saxpy-sm87.cubin
+          sha256sum r4-p4-out/package/saxpy-sm87.cubin \
+            > r4-p4-out/evidence/sm87-cubin-sha256.txt
+      - name: Download signed JetPack ARM64 CUDA driver link stub
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          bash tools/v2-r4-p4/prepare_driver_link_stub.sh r4-p4-out/link-stub
+      - name: Link original SM87 device code to JetPack-native AArch64 host via Driver ABI
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            gcc-aarch64-linux-gnu libc6-dev-arm64-cross
+          # Link against NVIDIA's SDK stub, as recommended for CUDA driver
+          # clients. Real libcuda has transitive NvRm dependencies which the
+          # intentionally thin ABI sysroot doesn't try to reconstruct.
+          driver_stub=$(cat r4-p4-out/link-stub/evidence/stub-path.txt)
+          test -e "$driver_stub"
+          driver_so=$(find r4-p4-out/target/sysroot -type f -name 'libcuda.so*' -print -quit)
+          test -n "$driver_so"
+          readelf -Ws "$driver_so" > r4-p4-out/evidence/target-driver-dynsym.txt
+          for symbol in cuInit cuDeviceGet cuModuleLoad cuLaunchKernel cuMemAlloc_v2 cuMemcpyDtoH_v2; do
+            grep -q "$symbol" r4-p4-out/evidence/target-driver-dynsym.txt || {
+              echo "R4_P4_REJECT=TARGET_DRIVER_MISSING_$symbol" >&2
+              exit 1
+            }
+          done
+          aarch64-linux-gnu-gcc -std=c11 -O2 -Wall -Wextra -Werror -fPIE -pie \
+            -o r4-p4-out/package/jetpack-sm87-smoke \
+            tools/v2-r4-p4/jetpack_sm87_smoke.c "$driver_stub"
+          readelf -d r4-p4-out/package/jetpack-sm87-smoke | grep -q 'Shared library: \[libcuda.so.1\]'
+          python3 tools/v2-r4-p3/elf_abi_gate.py \
+            --binary r4-p4-out/package/jetpack-sm87-smoke \
+            --sysroot r4-p4-out/target/sysroot \
+            --require-lib libcuda.so.1 \
+            --report r4-p4-out/evidence/jetpack-native-abi-report.json \
+            --expect pass
+          file r4-p4-out/package/jetpack-sm87-smoke
+          echo 'R4_P4_JETPACK_NATIVE_ARM64_DRIVER_ABI=PASS_STATIC'
+      - name: Assemble read-only Jetson device test and checksum archive
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          cp tools/v2-r4-p4/run-smoke.sh r4-p4-out/package/run-smoke.sh
+          chmod 755 r4-p4-out/package/run-smoke.sh
+          chmod 755 r4-p4-out/package/jetpack-sm87-smoke
+          (
+            cd r4-p4-out/package
+            sha256sum jetpack-sm87-smoke saxpy-sm87.cubin > SHA256SUMS
+            tar -czf ../jetpack-native-sm87-smoke.tar.gz \
+              jetpack-sm87-smoke saxpy-sm87.cubin run-smoke.sh SHA256SUMS
+          )
+          sha256sum r4-p4-out/jetpack-native-sm87-smoke.tar.gz \
+            > r4-p4-out/evidence/bundle-sha256.txt
+          echo 'R4_P4_JETSON_SMOKE_BUNDLE=READY_NOT_EXECUTED'
+          {
+            echo '### R4-P4 static build'
+            echo '- **PASS**: extracted R4-P2 genuine SM87 cubin (no nvcc rerun)'
+            echo '- **PASS**: Ubuntu AArch64 host linked to L4T 39.2.1 libcuda.so.1'
+            echo '- **PASS**: JetPack 7.2.1 static ABI audit'
+            echo '- **NOT TESTED**: real Jetson kernel launch (manual test required)'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload R4-P4 self-built smoke bundle (no redistributed NVIDIA libraries)
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: r4-p4-jetpack-native-sm87-device-smoke
+          path: r4-p4-out/jetpack-native-sm87-smoke.tar.gz
+          if-no-files-found: error
+          retention-days: 30
+      - name: Upload R4-P4 package and ABI provenance only
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: r4-p4-jetpack-native-sm87-evidence
+          path: |
+            r4-p4-out/evidence/
+            r4-p4-out/target/evidence/
+            r4-p4-out/host-tools/evidence/
+            r4-p4-out/link-stub/evidence/
+            r4-p4-out/package/original-fatbin.txt
+          if-no-files-found: warn
+          retention-days: 30
