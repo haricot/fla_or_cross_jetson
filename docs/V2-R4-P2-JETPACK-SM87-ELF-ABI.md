@@ -1,5 +1,7 @@
 # V2-R4-P2 — JetPack CUDA ABI, SM87 fatbin and deployability gate
 
+Status: **PASS_CROSS_CUDA132_SM87 / BLOCKED_JETPACK_DEPLOY / CUDA133_NOT_AVAILABLE** (2026-11-07).
+
 Branch: `v2-r4-p2-cuda133-sm87-audit`, based on R4-P1
 (`v2-r4-p1-cuda-default-probe`). No physical Jetson was modified.
 
@@ -34,8 +36,20 @@ rejection and tests actual GPU code with JetPack-aligned CUDA 13.2 instead.
 R4-P1 already proved AArch64 compile+link with default CUDA 13.2:
 https://github.com/haricot/fla_or_cross_jetson/actions/runs/42398040976
 
-R4-P2 CI:
-https://github.com/haricot/fla_or_cross_jetson/actions/workflows/v2-r4-p2-cuda133-sm87-audit.yml
+R4-P2 CI: **PASS** (run #42399023587)
+https://github.com/haricot/fla_or_cross_jetson/actions/runs/42399023587
+
+Reusable evidence bundle and compiled AArch64 ELF (expires 2026-11-21):
+https://github.com/haricot/fla_or_cross_jetson/actions/runs/42399023587/artifacts/13584756100
+
+The compiler invocation included `--generate-code=arch=compute_87,code=[compute_87,sm_87]`.
+The independent `cuobjdump --list-elf` listed **`saxpy.1.sm_87.cubin`**.
+ELF machine is **AArch64**. The interpreter is
+`/nix/store/gl2hah8q6fmjwys4g3yll8xmm8lapkw3-glibc-aarch64-unknown-linux-gnu-2.42-103/lib/ld-linux-aarch64.so.1`.
+CUDA13.3 evaluation returned `BLOCKED_UNSUPPORTED_CCCL_AARCH64` as expected.
+The CI classified deployment as **`BLOCKED_NIX_ELF_INTERPRETER`**.
+
+`PASS` here means **cross-build and static SM87 fatbin inspection**, never a Jetson runtime test.
 
 The job checks all of these independently:
 
