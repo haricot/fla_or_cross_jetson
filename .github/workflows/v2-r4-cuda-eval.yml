@@ -18,12 +18,14 @@ jobs:
         with:
           extra_nix_config: |
             experimental-features = nix-command flakes
-      - name: Bootstrap independent CUDA-probe lock
+      - name: Verify pinned CUDA-probe lock
         shell: bash
         run: |
           set -Eeuo pipefail
+          test -s experiments/cuda-jetpack/flake.lock
           nix flake lock ./experiments/cuda-jetpack
-          echo "R4_CUDA_LOCK_BASE64=$(base64 -w0 experiments/cuda-jetpack/flake.lock)"
+          git diff --exit-code -- experiments/cuda-jetpack/flake.lock
+          echo 'CUDA cross inputs pinned: PASS'
       - name: Evaluate CUDA 12.6 cross derivation
         run: nix eval --raw ./experiments/cuda-jetpack#packages.x86_64-linux.cuda12-6-cross-saxpy.drvPath
       - name: Evaluate CUDA 13.2 cross derivation
