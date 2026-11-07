@@ -74,8 +74,14 @@ for archive in ./*.deb; do
   if [[ "$pkg" == nvidia-l4t-cuda || "$pkg" == nvidia-l4t-cuda-nvgpu ]]; then
     [[ "$ver" == 39.2.1-* ]] || { echo "Expected L4T 39.2.1, got $ver" >&2; exit 1; }
   fi
-  if [[ "$pkg" == cuda-cudart-13-2 || "$pkg" == libcublas-13-2 ]]; then
+  if [[ "$pkg" == cuda-cudart-13-2 ]]; then
     [[ "$ver" == 13.2.* ]] || { echo "Expected CUDA 13.2, got $ver" >&2; exit 1; }
+  fi
+  # cuBLAS has its own component versioning. In the signed CUDA 13.2
+  # repository it is 13.4.1.3, not 13.2.x. Pin the observed component
+  # rather than guessing a toolkit-style version number.
+  if [[ "$pkg" == libcublas-13-2 ]]; then
+    [[ "$ver" == 13.4.1.3-1 ]] || { echo "Unexpected JetPack 7.2.1 cuBLAS $ver" >&2; exit 1; }
   fi
   sha=$(sha256sum "$archive")
   printf '%s\t%s\t%s\t%s\t%s\n' "$pkg" "$ver" "$arch" "${sha%% *}" "${archive#./}" \
