@@ -12,7 +12,7 @@
 
   outputs = { nixpkgs, jetpack, ... }:
     let
-      pkgs = import nixpkgs {
+      mkCrossPkgs = extraOverlays: import nixpkgs {
         localSystem = "x86_64-linux";
         crossSystem = "aarch64-linux";
         config = {
@@ -20,12 +20,22 @@
           cudaSupport = true;
           cudaCapabilities = [ "8.7" ];
         };
-        overlays = [ jetpack.overlays.default ];
+        overlays = [ jetpack.overlays.default ] ++ extraOverlays;
       };
+      pkgs = mkCrossPkgs [];
+      # PR #580: a versioned CUDA set must also be the default when cross-building.
+      withDefaultCuda = versionedAttr: mkCrossPkgs [
+        (final: prev: { cudaPackages = builtins.getAttr versionedAttr prev; })
+      ];
+      cuda126Pkgs = withDefaultCuda "cudaPackages_12_6";
+      cuda132Pkgs = withDefaultCuda "cudaPackages_13_2";
     in
     {
       packages.x86_64-linux.cuda12-6-cross-saxpy = pkgs.cudaPackages_12_6.saxpy;
       # New target: CUDA 13.2 is JetPack 7.x's version family. NOT yet validated by PR #580.
       packages.x86_64-linux.cuda13-2-cross-saxpy = pkgs.cudaPackages_13_2.saxpy;
+      # Isolated diagnostic targets; preserve existing baseline derivations.
+      packages.x86_64-linux.cuda12-6-default-cross-saxpy = cuda126Pkgs.cudaPackages.saxpy;
+      packages.x86_64-linux.cuda13-2-default-cross-saxpy = cuda132Pkgs.cudaPackages.saxpy;
     };
 }
