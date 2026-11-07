@@ -76,7 +76,8 @@ jobs:
           set -Eeuo pipefail
           # Only on a disposable GitHub runner; does not touch the user's PC.
           sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu
+          sudo apt-get install -y --no-install-recommends \
+            gcc-aarch64-linux-gnu libc6-dev-arm64-cross
           bash tools/v2-r4-p3/build_jetpack_abi_probe.sh \
             r4-p3-out/sysroot \
             r4-p3-out/probe/jetpack-abi-probe
