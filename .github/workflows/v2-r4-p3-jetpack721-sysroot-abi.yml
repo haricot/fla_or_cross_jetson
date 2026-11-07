@@ -1,0 +1,109 @@
+name: V2-R4-P3 JetPack 7.2.1 signed sysroot and ELF ABI (no flash)
+
+on:
+  push:
+    branches: [v2-r4-p3-jetpack721-sysroot-abi]
+    paths:
+      - 'tools/v2-r4-p3/**'
+      - '.github/workflows/v2-r4-p3-jetpack721-sysroot-abi.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  jetpack-sysroot-static-abi:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test read-only ABI gate locally (no compiler)
+        run: python3 -m unittest discover -s tools/v2-r4-p3 -p 'test_*.py' -v
+      - name: Reuse compiled CUDA AArch64 SM87 sample from R4-P2
+        uses: actions/download-artifact@v4
+        with:
+          name: r4-p2-sm87-elf-abi-evidence
+          path: r4-p2-input
+          run-id: 42399023587
+          github-token: ${{ github.token }}
+      - name: Assert exact reused binary and architecture
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          test -f r4-p2-input/saxpy-aarch64-cuda132-sm87
+          file r4-p2-input/saxpy-aarch64-cuda132-sm87
+          readelf -h r4-p2-input/saxpy-aarch64-cuda132-sm87 | grep -Eq 'Machine:.*AArch64'
+          grep -q 'sm_87' r4-p2-input/cuobjdump-list-elf.txt
+          echo 'R4_P3_REUSED_R4_P2_SM87_BINARY=PASS_NO_CUDA_REBUILD'
+      - name: Prepare signed, version-checked JetPack 7.2.1 thin ABI sysroot
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          bash tools/v2-r4-p3/prepare_thin_sysroot.sh r4-p3-out
+      - name: Verify deployability of unchanged Nix ELF against JetPack 7.2.1 ABI
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          python3 tools/v2-r4-p3/elf_abi_gate.py \
+            --binary r4-p2-input/saxpy-aarch64-cuda132-sm87 \
+            --sysroot r4-p3-out/sysroot \
+            --require-lib libcudart.so.13 \
+            --require-lib libcuda.so.1 \
+            --report r4-p3-out/evidence/abi-report.json \
+            --expect blocked
+          python3 -c 'import json; p=json.load(open("r4-p3-out/evidence/abi-report.json")); assert "NIX_STORE_INTERPRETER" in p["reasons"], p'
+          {
+            echo '### R4-P3 — JetPack ABI static gate'
+            echo '- Previous CUDA SM87 binary: **REUSED** (zero GPU rebuild)'
+            echo '- Package origin: **signed Ubuntu 24.04 ARM64 + NVIDIA r39.2 ARM64**'
+            echo '- L4T package version: **39.2.1**'
+            echo '- Target runtime: **CUDA 13.2**'
+            echo '- Nix ELF deployment: **BLOCKED** (expected Nix interpreter)'
+            echo '- Jetson execution: **NOT TESTED**'
+            echo ''
+            echo '#### Downloaded signed APT package manifest'
+            echo '\`\`\`text'
+            sed -n '1,15p' r4-p3-out/evidence/package-manifest.tsv
+            echo '\`\`\`'
+            echo ''
+            echo '#### ABI reason codes'
+            python3 -c 'import json; p=json.load(open("r4-p3-out/evidence/abi-report.json")); print("; ".join(p["reasons"]))'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Link an independent Ubuntu AArch64 CUDA 13 runtime ABI probe
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          # Only on a disposable GitHub runner; does not touch the user's PC.
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            gcc-aarch64-linux-gnu libc6-dev-arm64-cross
+          bash tools/v2-r4-p3/build_jetpack_abi_probe.sh \
+            r4-p3-out/sysroot \
+            r4-p3-out/probe/jetpack-abi-probe
+          python3 tools/v2-r4-p3/elf_abi_gate.py \
+            --binary r4-p3-out/probe/jetpack-abi-probe \
+            --sysroot r4-p3-out/sysroot \
+            --require-lib libcudart.so.13 \
+            --report r4-p3-out/evidence/ubuntu-cudart-abi-report.json \
+            --expect pass
+          sha256sum r4-p3-out/probe/jetpack-abi-probe \
+            > r4-p3-out/evidence/ubuntu-cudart-probe-sha256.txt
+          echo '- Ubuntu AArch64/CUDA 13 runtime link ABI: **PASS STATIC** (no Jetson execution)' \
+            >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload provenance and ABI reports only (not vendor binary packages)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: r4-p3-jetpack721-abi-metadata
+          path: r4-p3-out/evidence/
+          if-no-files-found: warn
+          retention-days: 30
+      - name: Upload reusable independent AArch64 ABI probe (no vendor libraries)
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: r4-p3-jetpack721-ubuntu-cudart-probe
+          path: r4-p3-out/probe/jetpack-abi-probe
+          if-no-files-found: error
+          retention-days: 30
