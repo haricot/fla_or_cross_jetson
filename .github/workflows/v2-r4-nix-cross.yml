@@ -23,13 +23,14 @@ jobs:
         run: |
           sudo install -d -o "$(id -un)" -g "$(id -gn)" -m 0755 /work /work/tmp /work/tmp/state
           ./gates/audit-r234.sh
-      - name: Generate lock (CI bootstrap only)
+      - name: Verify committed input lock
         shell: bash
         run: |
           set -Eeuo pipefail
+          test -s flake.lock
           nix flake lock
-          echo "R4_LOCK_BASE64=$(base64 -w0 flake.lock)"
-          echo 'Reproducibility gate: pending publication of flake.lock to Git'
+          git diff --exit-code -- flake.lock
+          echo 'R4-P0 Nix flake inputs pinned: PASS'
       - name: Evaluate cross Rust target
         run: nix eval --raw .#packages.x86_64-linux.cross-rust-aarch64.drvPath
       - name: Build aarch64 Rust ELF (CPU-only)
