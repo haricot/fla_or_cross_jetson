@@ -90,6 +90,21 @@ for archive in ./*.deb; do
 done
 popd >/dev/null
 
+# Ubuntu 24.04 has a merged-/usr root filesystem: /lib is an alias of
+# /usr/lib. Merely extracting selected .debs into an empty directory does
+# not recreate that base-files filesystem layout, so the ARM64 interpreter
+# at /lib/ld-linux-aarch64.so.1 would otherwise appear absent. Reconstruct
+# only this standard rootfs alias; never patch the ELF or synthesize a loader.
+if [[ ! -e "$out_dir/sysroot/lib" && ! -L "$out_dir/sysroot/lib" ]]; then
+  ln -s usr/lib "$out_dir/sysroot/lib"
+elif [[ -d "$out_dir/sysroot/lib" && ! -e "$out_dir/sysroot/lib/ld-linux-aarch64.so.1" ]]; then
+  ln -s ../usr/lib/ld-linux-aarch64.so.1 \
+    "$out_dir/sysroot/lib/ld-linux-aarch64.so.1"
+fi
+test -e "$out_dir/sysroot/usr/lib/ld-linux-aarch64.so.1"
+test -e "$out_dir/sysroot/lib/ld-linux-aarch64.so.1"
+echo 'R4_P3_UBUNTU_MERGED_USR_ARM64_LOADER=RESOLVED'
+
 test -e "$out_dir/sysroot/lib/aarch64-linux-gnu/libc.so.6" \
   || test -e "$out_dir/sysroot/usr/lib/aarch64-linux-gnu/libc.so.6"
 test -n "$(find "$out_dir/sysroot" -name 'libcudart.so*' -print -quit)"
