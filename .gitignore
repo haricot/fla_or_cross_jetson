@@ -1,0 +1,13 @@
+.cache/
+dist/
+target/
+*.log
+.env
+
+# V2 alpha2 external caches if VOLUME points inside project
+cache/
+downloads/
+sources/
+dist/
+.nvsdkm/
+tmp/

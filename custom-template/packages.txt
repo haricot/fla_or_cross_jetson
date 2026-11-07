@@ -1,0 +1,9 @@
+# One apt package per line (or several space-separated names).
+# Lines beginning with # are ignored.
+# Examples:
+# htop
+# tmux
+# python3-pip
+
+# CUDA 13.3 est géré par `jetsonctl native-sdk apply` dans fix13/fix14.
+# Ne pas ajouter cuda-toolkit-13-3 ici sauf si vous désactivez explicitement le stage native-sdk.

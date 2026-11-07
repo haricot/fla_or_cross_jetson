@@ -1,0 +1,78 @@
+services:
+  sdkm:
+    image: ${SDK_MANAGER_IMAGE:-fla-or-cross-jetson-sdkm:jp721}
+    privileged: true
+    # NVIDIA l4t_initrd_flash image generation is root-only.
+    # Make this explicit instead of relying on the Docker image default user.
+    user: "0:0"
+    network_mode: host
+    environment:
+      # NVIDIA l4t_create_images_for_kernel_flash.sh checks the USER
+      # environment variable in addition to requiring uid 0.
+      USER: root
+      LOGNAME: root
+      HOME: /root
+      # Keep Linux_for_Tegra at the identical absolute path on host and container.
+      DOWNLOAD_DIR: ${VOLUME}/downloads
+      JETPACK: ${JETPACK}
+      L4T: ${L4T}
+      TARGET_UBUNTU: ${TARGET_UBUNTU}
+      PLATFORM_NAME: ${PLATFORM_NAME:-orin-nano-super}
+      PLATFORM_FAMILY: ${PLATFORM_FAMILY:-orin}
+      PLATFORM_HARDWARE_TESTED: ${PLATFORM_HARDWARE_TESTED:-no}
+      PLATFORM_MIN_STORAGE_GIB: ${PLATFORM_MIN_STORAGE_GIB:-}
+      BOARD: ${BOARD}
+      SOC: ${SOC:-t234}
+      RECOVERY_USB_PRODUCTS: ${RECOVERY_USB_PRODUCTS:-7523,7623}
+      SDKM_TARGET: ${SDKM_TARGET}
+      SDKM_DOWNLOAD_DIR: ${SDKM_DOWNLOAD_DIR:-/work/sdkmanager/downloads}
+      SDKM_CATALOG_DIR: ${SDKM_CATALOG_DIR:-/work/sdkmanager/catalog}
+      FLASH_LAYOUT: ${FLASH_LAYOUT:-orin-nx-nano}
+      FLASH_TARGET: ${FLASH_TARGET:-nvme}
+      EXTERNAL_DEVICE: ${EXTERNAL_DEVICE:-nvme0n1p1}
+      FLASH_NETWORK: ${FLASH_NETWORK:-usb0}
+      FLASH_ROOTDEV: ${FLASH_ROOTDEV:-external}
+      FLASH_ERASE_ALL: ${FLASH_ERASE_ALL:-1}
+      NVME_XML: ${NVME_XML}
+      QSPI_XML: ${QSPI_XML:-}
+      FLASH_USE_QSPI_XML: ${FLASH_USE_QSPI_XML:-1}
+      L4T_BSP_FILE: ${L4T_BSP_FILE}
+      L4T_ROOTFS_FILE: ${L4T_ROOTFS_FILE}
+      DEFAULT_USER: ${DEFAULT_USER:-}
+      DEFAULT_PASSWORD_FILE: ${DEFAULT_PASSWORD_FILE-}
+      DEFAULT_HOSTNAME: ${DEFAULT_HOSTNAME:-jetson-orin}
+      DEFAULT_AUTOLOGIN: ${DEFAULT_AUTOLOGIN:-0}
+      DEFAULT_LOCALE: ${DEFAULT_LOCALE:-fr_FR.UTF-8}
+      DEFAULT_KEYBOARD: ${DEFAULT_KEYBOARD:-fr}
+      DEFAULT_SSH_AUTHORIZED_KEY_FILE: ${DEFAULT_SSH_AUTHORIZED_KEY_FILE:-/work/secrets/authorized_key.pub}
+      DEFAULT_SSH_KEY_ONLY: ${DEFAULT_SSH_KEY_ONLY:-0}
+      DEFAULT_SUDO_NOPASSWD: ${DEFAULT_SUDO_NOPASSWD:-0}
+      DEFAULT_WIFI_SSID: ${DEFAULT_WIFI_SSID:-}
+      DEFAULT_WIFI_PSK_FILE: ${DEFAULT_WIFI_PSK_FILE-}
+      DEFAULT_WIFI_PSK_OPENSSL_FILE: ${DEFAULT_WIFI_PSK_OPENSSL_FILE-}
+      NATIVE_CUDA_ENABLE: ${NATIVE_CUDA_ENABLE:-1}
+      NATIVE_CUDA_VERSION: ${NATIVE_CUDA_VERSION:-13.3}
+      NATIVE_CUDA_REPO: ${NATIVE_CUDA_REPO:-https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/sbsa}
+      NATIVE_CUDA_KEYRING_VERSION: ${NATIVE_CUDA_KEYRING_VERSION:-1.1-1}
+      NATIVE_CUDA_TOOLKIT_PACKAGE: ${NATIVE_CUDA_TOOLKIT_PACKAGE:-cuda-toolkit-13-3}
+      NATIVE_CUDA_COMPAT_PACKAGE: ${NATIVE_CUDA_COMPAT_PACKAGE:-cuda-compat-orin-13-3}
+      NATIVE_CUDA_ROOT: ${NATIVE_CUDA_ROOT:-/usr/local/cuda-13.3}
+      NATIVE_CUDA_COMPAT_DIR: ${NATIVE_CUDA_COMPAT_DIR:-/usr/local/cuda-13.3/compat_orin}
+      HOST_FLASH_IFACE: ${HOST_FLASH_IFACE:-}
+      HOST_FLASH_IFACE_TIMEOUT: ${HOST_FLASH_IFACE_TIMEOUT:-1800}
+      HOST_FLASH_WATCH_EXTERNAL: ${HOST_FLASH_WATCH_EXTERNAL:-0}
+      ALLOW_STALE_IMAGES: ${ALLOW_STALE_IMAGES:-0}
+    volumes:
+      # NVIDIA initrd/NFS requires the exported path to exist under the same
+      # absolute name in the host and container mount namespaces.
+      - ${VOLUME}/downloads:${VOLUME}/downloads
+      # Compatibility alias for auxiliary tools that still expect /work/downloads.
+      - ${VOLUME}/downloads:/work/downloads
+      - ${VOLUME}/sdkmanager:/work/sdkmanager
+      - ${VOLUME}/tmp:/work/tmp
+      - ${VOLUME}/.nvsdkm:/home/nvidia/.nvsdkm
+      - ${VOLUME}/custom:/work/custom:ro
+      - ${VOLUME}/secrets:/work/secrets:ro
+      # NVIDIA image generation allocates loop devices dynamically.
+      # Docker's privileged /dev view can be static, so bind host /dev live.
+      - /dev:/dev
