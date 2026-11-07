@@ -1,0 +1,102 @@
+name: V2-R4-P2 JetPack-aligned SM87 fatbin and ELF ABI audit (no Jetson)
+
+on:
+  push:
+    branches: [v2-r4-p2-cuda133-sm87-audit]
+    paths:
+      - 'experiments/cuda-jetpack/flake.nix'
+      - 'experiments/cuda-jetpack/flake.lock'
+      - '.github/workflows/v2-r4-p2-cuda133-sm87-audit.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  cuda132-sm87-audit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cachix/install-nix-action@v31.11.3
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+            max-jobs = 2
+      - name: Check pinned inputs and explicitly classify CUDA 13.3 availability
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p r4-p2-evidence
+          nix flake lock ./experiments/cuda-jetpack
+          git diff --exit-code -- experiments/cuda-jetpack/flake.lock
+          for attr in cuda13-2-default-cross-saxpy cuda13-2-host-cuobjdump; do
+            nix eval --raw "./experiments/cuda-jetpack#packages.x86_64-linux.${attr}.drvPath"
+          done
+          if nix eval --raw './experiments/cuda-jetpack#packages.x86_64-linux.cuda13-3-default-cross-saxpy.drvPath' > r4-p2-evidence/cuda133-derivation.txt 2> r4-p2-evidence/cuda133-eval-stderr.txt; then
+            echo 'CUDA133_CROSS_EVAL=AVAILABLE_NOT_BUILT' | tee r4-p2-evidence/cuda133-status.txt
+          else
+            grep -q 'cuda13.3-cuda_cccl-0-unsupported' r4-p2-evidence/cuda133-eval-stderr.txt
+            echo 'CUDA133_CROSS_EVAL=BLOCKED_UNSUPPORTED_CCCL_AARCH64' | tee r4-p2-evidence/cuda133-status.txt
+          fi
+          df -h / /nix
+      - name: Build JetPack-aligned CUDA 13.2 and audit SM87 embedded code and ELF
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          out=$(nix build -L --no-link --print-out-paths './experiments/cuda-jetpack#cuda13-2-default-cross-saxpy')
+          inspector=$(nix build -L --no-link --print-out-paths './experiments/cuda-jetpack#cuda13-2-host-cuobjdump')
+          binary="$out/bin/saxpy"
+          tool="$inspector/bin/cuobjdump"
+          test -x "$binary"
+          test -x "$tool"
+          file "$binary" | tee r4-p2-evidence/file.txt
+          readelf -h "$binary" > r4-p2-evidence/elf-header.txt
+          readelf -l "$binary" > r4-p2-evidence/elf-program-headers.txt
+          readelf -d "$binary" > r4-p2-evidence/elf-dynamic.txt
+          readelf --version-info "$binary" > r4-p2-evidence/elf-symbol-versions.txt
+          "$tool" --list-elf "$binary" | tee r4-p2-evidence/cuobjdump-list-elf.txt
+          "$tool" --list-ptx "$binary" > r4-p2-evidence/cuobjdump-list-ptx.txt || true
+          grep -Eq 'Machine:.*AArch64' r4-p2-evidence/elf-header.txt
+          # Verify the actual embedded Orin cubin: CMAKE_CUDA_ARCHITECTURES=87 alone is insufficient.
+          grep -Eq 'sm_87' r4-p2-evidence/cuobjdump-list-elf.txt
+          cp "$binary" r4-p2-evidence/saxpy-aarch64-cuda132-sm87
+          echo 'CUDA132_CROSS_BUILD=PASS_AARCH64_SM87_CUBIN' | tee r4-p2-evidence/cuda132-status.txt
+          if grep -q '/nix/store/' r4-p2-evidence/elf-program-headers.txt; then
+            echo 'JETPACK_DEPLOY=BLOCKED_NIX_ELF_INTERPRETER' | tee r4-p2-evidence/jetpack-deploy-status.txt
+          else
+            echo 'JETPACK_DEPLOY=NEEDS_SYSROOT_AND_RUNTIME_VALIDATION' | tee r4-p2-evidence/jetpack-deploy-status.txt
+          fi
+          {
+            echo '### R4-P2 evidence (no Jetson)'
+            echo "- $(cat r4-p2-evidence/cuda132-status.txt)"
+            echo "- $(cat r4-p2-evidence/cuda133-status.txt)"
+            echo "- $(cat r4-p2-evidence/jetpack-deploy-status.txt)"
+            echo '- JetPack 7.2.1/L4T 39.2.1 uses CUDA 13.2.2; CUDA 13.3 is NOT its SDK.'
+            echo ''
+            echo '#### ELF interpreter'
+            grep 'Requesting program interpreter' r4-p2-evidence/elf-program-headers.txt || true
+            echo ''
+            echo '#### Dynamic dependencies'
+            grep -E 'NEEDED|RPATH|RUNPATH' r4-p2-evidence/elf-dynamic.txt || true
+            echo ''
+            echo '#### Actual GPU fatbin'
+            head -40 r4-p2-evidence/cuobjdump-list-elf.txt
+          } >> "$GITHUB_STEP_SUMMARY"
+          df -h / /nix
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: r4-p2-sm87-elf-abi-evidence
+          path: r4-p2-evidence/
+          if-no-files-found: warn
+          retention-days: 14
+      - name: Print failed CUDA compiler logs
+        if: failure()
+        shell: bash
+        run: |
+          for log in $(find /tmp -type f \( -name CMakeConfigureLog.yaml -o -name CMakeError.log -o -name CMakeOutput.log \) 2>/dev/null | head -8); do
+            echo "::group::$log"
+            tail -n 120 "$log" || true
+            echo "::endgroup::"
+          done
